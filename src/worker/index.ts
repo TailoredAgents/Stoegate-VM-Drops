@@ -1,0 +1,44 @@
+import { getEnv } from "@/lib/env";
+import { logger } from "@/lib/logger";
+import {
+  handleGenerateAudio,
+  handlePrepareCampaign,
+  handleSendDrop,
+} from "@/jobs/handlers";
+import { getBoss, QUEUES, startBoss } from "@/jobs/queues";
+
+async function main() {
+  const env = getEnv();
+  const boss = await startBoss();
+  const workerOptions = { localConcurrency: env.WORKER_CONCURRENCY };
+  await boss.work(QUEUES.prepareCampaign, workerOptions, async (jobs) =>
+    Promise.all(jobs.map(handlePrepareCampaign)),
+  );
+  await boss.work(QUEUES.generateAudio, workerOptions, async (jobs) =>
+    Promise.all(jobs.map(handleGenerateAudio)),
+  );
+  await boss.work(QUEUES.sendDrop, workerOptions, async (jobs) =>
+    Promise.all(jobs.map(handleSendDrop)),
+  );
+  logger.info(
+    {
+      concurrency: env.WORKER_CONCURRENCY,
+      realAudio: env.AUDIO_GENERATION_LIVE_ENABLED,
+      liveSends: env.RVM_LIVE_SENDS_ENABLED,
+    },
+    "worker started",
+  );
+
+  const shutdown = async (signal: string) => {
+    logger.info({ signal }, "worker shutting down");
+    await getBoss().stop({ graceful: true, timeout: 25_000 });
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+}
+
+main().catch((error) => {
+  logger.fatal({ error }, "worker failed to start");
+  process.exit(1);
+});

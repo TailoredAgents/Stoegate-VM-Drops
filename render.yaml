@@ -1,0 +1,143 @@
+databases:
+  - name: stonegate-vm-drops-db
+    region: virginia
+    databaseName: stonegate_vm_drops
+    user: stonegate_vm_drops
+
+services:
+  - type: web
+    name: stonegate-vm-drops
+    runtime: node
+    region: virginia
+    buildCommand: npm ci && npm run db:generate && npm run build
+    preDeployCommand: npm run db:deploy
+    initialDeployHook: npm run db:seed
+    startCommand: npm start
+    healthCheckPath: /api/health
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: NODE_VERSION
+        value: 22.19.0
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stonegate-vm-drops-db
+          property: connectionString
+      - key: APP_BASE_URL
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SESSION_TTL_HOURS
+        value: "12"
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD_HASH
+        sync: false
+      - key: STONEGATE_INTEGRATION_API_KEY
+        sync: false
+      - key: DROP_COWBOY_WEBHOOK_SECRET
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_VOICE_ID
+        sync: false
+      - key: ELEVENLABS_MODEL_ID
+        value: eleven_flash_v2_5
+      - key: ELEVENLABS_OUTPUT_FORMAT
+        value: mp3_44100_128
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: R2_PRESIGNED_URL_TTL_SECONDS
+        value: "86400"
+      - key: DROP_COWBOY_API_ENDPOINT
+        value: https://api.dropcowboy.com/v1/rvm
+      - key: DROP_COWBOY_TEAM_ID
+        sync: false
+      - key: DROP_COWBOY_SECRET
+        sync: false
+      - key: DROP_COWBOY_BRAND_ID
+        sync: false
+      - key: DROP_COWBOY_FORWARDING_NUMBER
+        sync: false
+      - key: RVM_LIVE_SENDS_ENABLED
+        value: "false"
+      - key: AUDIO_GENERATION_LIVE_ENABLED
+        value: "false"
+      - key: MAX_LIVE_CAMPAIGN_SEND_LIMIT
+        value: "10"
+      - key: DEFAULT_CAMPAIGN_SEND_LIMIT
+        value: "1000"
+      - key: PREVIEW_SAMPLE_SIZE
+        value: "10"
+
+  - type: worker
+    name: stonegate-vm-drops-worker
+    runtime: node
+    region: virginia
+    buildCommand: npm ci && npm run db:generate
+    startCommand: npm run worker
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - key: NODE_VERSION
+        value: 22.19.0
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stonegate-vm-drops-db
+          property: connectionString
+      - key: APP_BASE_URL
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: STONEGATE_INTEGRATION_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_VOICE_ID
+        sync: false
+      - key: ELEVENLABS_MODEL_ID
+        value: eleven_flash_v2_5
+      - key: ELEVENLABS_OUTPUT_FORMAT
+        value: mp3_44100_128
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: R2_PRESIGNED_URL_TTL_SECONDS
+        value: "86400"
+      - key: DROP_COWBOY_API_ENDPOINT
+        value: https://api.dropcowboy.com/v1/rvm
+      - key: DROP_COWBOY_TEAM_ID
+        sync: false
+      - key: DROP_COWBOY_SECRET
+        sync: false
+      - key: DROP_COWBOY_BRAND_ID
+        sync: false
+      - key: DROP_COWBOY_FORWARDING_NUMBER
+        sync: false
+      - key: DROP_COWBOY_WEBHOOK_SECRET
+        sync: false
+      - key: RVM_LIVE_SENDS_ENABLED
+        value: "false"
+      - key: AUDIO_GENERATION_LIVE_ENABLED
+        value: "false"
+      - key: MAX_LIVE_CAMPAIGN_SEND_LIMIT
+        value: "10"
+      - key: WORKER_CONCURRENCY
+        value: "4"
+      - key: DEFAULT_CAMPAIGN_SEND_LIMIT
+        value: "1000"
+      - key: PREVIEW_SAMPLE_SIZE
+        value: "10"
