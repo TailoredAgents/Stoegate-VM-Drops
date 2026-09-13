@@ -9,7 +9,7 @@ services:
     name: stonegate-vm-drops
     runtime: node
     region: virginia
-    buildCommand: npm ci && npm run db:generate && npm run build
+    buildCommand: npm ci --include=dev && npm run db:generate && npm run build
     preDeployCommand: npm run db:deploy
     initialDeployHook: npm run db:seed
     startCommand: npm start
@@ -81,7 +81,7 @@ services:
     name: stonegate-vm-drops-worker
     runtime: node
     region: virginia
-    buildCommand: npm ci && npm run db:generate
+    buildCommand: npm ci --include=dev && npm run db:generate
     startCommand: npm run worker
     maxShutdownDelaySeconds: 60
     envVars:
