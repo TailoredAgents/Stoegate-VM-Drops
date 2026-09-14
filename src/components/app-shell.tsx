@@ -8,6 +8,7 @@ import {
   ShieldBan,
   Upload,
   Voicemail,
+  Workflow,
 } from "lucide-react";
 import { logoutAction } from "@/app/login/actions";
 
@@ -15,6 +16,7 @@ const nav = [
   ["Dashboard", "/dashboard", Gauge],
   ["Campaigns", "/campaigns", Megaphone],
   ["New campaign", "/campaigns/new", Upload],
+  ["Outreach", "/outreach", Workflow],
   ["Scripts & voices", "/scripts", FileAudio2],
   ["Suppression", "/suppression", ShieldBan],
   ["Settings", "/settings", Settings],

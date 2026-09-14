@@ -12,6 +12,7 @@ export async function POST(request: Request) {
     request.headers.get("x-dropcowboy-signature") ??
     request.headers.get("x-dc-signature");
   const secret = getEnv().DROP_COWBOY_WEBHOOK_SECRET;
+  if (!secret) return jsonError("Drop Cowboy webhook is not configured", 503);
   if (!verifyDropCowboySignature(rawBody, signature, secret))
     return jsonError("Invalid signature", 401);
   try {

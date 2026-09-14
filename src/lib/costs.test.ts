@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { calculateCampaignCosts, calculateVABenchmarks } from "./costs";
+import {
+  allocateSharedCost,
+  calculateCampaignCosts,
+  calculateCarrierCosts,
+  calculateDropCowboyBilling,
+  calculateVABenchmarks,
+} from "./costs";
 
 describe("campaign and VA costs", () => {
   it("uses integer cents and protects zero denominators", () => {
@@ -60,6 +66,71 @@ describe("campaign and VA costs", () => {
       vaCostPerQualifiedLeadCents: 4667,
       vaExpectedLaborCostPerDealCents: 70000,
       vaEquivalentConversations: 400,
+    });
+  });
+});
+
+describe("account-specific provider economics", () => {
+  it("treats the Drop Cowboy quote as a minimum credit, not fee plus usage", () => {
+    expect(
+      calculateDropCowboyBilling({
+        successfulRvmCount: 10_000,
+        monthlyMinimumCents: 25_000,
+        successCostCents: 1,
+      }),
+    ).toMatchObject({
+      usageValueCents: 10_000,
+      invoiceCents: 25_000,
+      unusedMinimumCreditCents: 15_000,
+    });
+    expect(
+      calculateDropCowboyBilling({
+        successfulRvmCount: 25_001,
+        monthlyMinimumCents: 25_000,
+        successCostCents: 1,
+      }),
+    ).toMatchObject({
+      usageValueCents: 25_001,
+      invoiceCents: 25_001,
+      unusedMinimumCreditCents: 0,
+    });
+  });
+
+  it("allocates one shared minimum exactly across campaigns", () => {
+    expect(
+      allocateSharedCost(25_000, { campaign_a: 1_000, campaign_b: 3_000 }),
+    ).toEqual({
+      allocations: { campaign_a: 6_250, campaign_b: 18_750 },
+      unallocatedCents: 0,
+    });
+    const thirds = allocateSharedCost(100, { a: 1, b: 1, c: 1 });
+    expect(Object.values(thirds.allocations).reduce((a, b) => a + b, 0)).toBe(
+      100,
+    );
+    expect(allocateSharedCost(25_000, {})).toEqual({
+      allocations: {},
+      unallocatedCents: 25_000,
+    });
+  });
+
+  it("calculates generic carrier fixed and estimated variable costs", () => {
+    expect(
+      calculateCarrierCosts({
+        attemptedRvmCount: 2_000,
+        attemptsWithActualDuration: 0,
+        actualDurationSeconds: 0,
+        averageSecondsPerAttempt: 30,
+        trunkMonthlyCents: 1_500,
+        didMonthlyCents: 115,
+        activeDidCount: 1,
+        voiceCentsPerMinute: 0.66,
+      }),
+    ).toMatchObject({
+      fixedCents: 1_615,
+      variableCents: 660,
+      totalCents: 2_275,
+      estimatedSeconds: 60_000,
+      durationBasis: "ESTIMATED",
     });
   });
 });

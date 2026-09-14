@@ -72,8 +72,10 @@ services:
         value: "false"
       - key: MAX_LIVE_CAMPAIGN_SEND_LIMIT
         value: "10"
+      - key: MAX_LIVE_DAILY_RVM_ATTEMPTS
+        value: "10"
       - key: DEFAULT_CAMPAIGN_SEND_LIMIT
-        value: "1000"
+        value: "2000"
       - key: PREVIEW_SAMPLE_SIZE
         value: "10"
 
@@ -135,9 +137,11 @@ services:
         value: "false"
       - key: MAX_LIVE_CAMPAIGN_SEND_LIMIT
         value: "10"
+      - key: MAX_LIVE_DAILY_RVM_ATTEMPTS
+        value: "10"
       - key: WORKER_CONCURRENCY
         value: "4"
       - key: DEFAULT_CAMPAIGN_SEND_LIMIT
-        value: "1000"
+        value: "2000"
       - key: PREVIEW_SAMPLE_SIZE
         value: "10"

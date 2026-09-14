@@ -4,6 +4,13 @@ import { z } from "zod";
 import { db } from "@/lib/db";
 import { normalizeUSPhone } from "@/lib/phone";
 import { safeEqual, sha256 } from "@/lib/utils";
+import {
+  applyCallbackOutcomeToSequencesTx,
+  recordRvmDeliveryTx,
+} from "@/lib/outreach-service";
+import { recordRvmSuccessUsageTx } from "@/lib/rvm-operations";
+import { getAppSettings } from "@/lib/settings";
+import { ensureOutreachBillingPeriod } from "@/lib/billing-economics";
 
 const webhookSchema = z
   .object({
@@ -31,7 +38,7 @@ export function verifyDropCowboySignature(
   signature: string | null,
   secret?: string,
 ): boolean {
-  if (!secret) return true;
+  if (!secret) return false;
   if (!signature) return false;
   const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
   return safeEqual(signature.replace(/^sha256=/, ""), expected);
@@ -93,6 +100,30 @@ function mapDropStatus(eventType: string): DropStatus | null {
   return null;
 }
 
+export function shouldApplyDropStatusTransition(
+  current: DropStatus,
+  incoming: DropStatus,
+  currentErrorCode?: string | null,
+) {
+  if (incoming === "OPTED_OUT") return true;
+  if (current === "OPTED_OUT" || current === "SKIPPED") return false;
+  if (current === "DELIVERED") return false;
+  if (current === "FAILED")
+    return (
+      incoming === "DELIVERED" && currentErrorCode === "RVM_SUBMISSION_UNKNOWN"
+    );
+  if (current === "DRY_RUN")
+    return incoming === "DELIVERED" || incoming === "FAILED";
+
+  const progress: Partial<Record<DropStatus, number>> = {
+    PENDING: 0,
+    QUEUED: 1,
+    SENT: 2,
+  };
+  if (incoming === "DELIVERED" || incoming === "FAILED") return true;
+  return (progress[incoming] ?? -1) > (progress[current] ?? -1);
+}
+
 export async function processDropCowboyWebhook(raw: unknown) {
   const event = normalizeWebhookPayload(raw);
   if (!event.foreignId) throw new Error("Webhook is missing foreign_id");
@@ -118,9 +149,23 @@ export async function processDropCowboyWebhook(raw: unknown) {
     event.occurredAt && !Number.isNaN(event.occurredAt.getTime())
       ? event.occurredAt
       : new Date();
-  let result: { duplicate: boolean; eventId: string };
+  if (drop.status !== "DRY_RUN") await ensureOutreachBillingPeriod(now);
+  let result: {
+    duplicate: boolean;
+    eventId: string;
+    appliedStatus: DropStatus | null;
+  };
   try {
     result = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`
+        SELECT "id" FROM "Drop"
+        WHERE "id" = ${drop.id}::uuid
+        FOR UPDATE
+      `;
+      const currentDrop = await tx.drop.findUniqueOrThrow({
+        where: { id: drop.id },
+        include: { campaignContact: { include: { contact: true } } },
+      });
       const deliveryEvent = await tx.deliveryEvent.create({
         data: {
           dropId: drop.id,
@@ -130,14 +175,24 @@ export async function processDropCowboyWebhook(raw: unknown) {
           occurredAt: now,
         },
       });
-      if (status) {
+      const applyProjection =
+        status !== null &&
+        shouldApplyDropStatusTransition(
+          currentDrop.status,
+          status,
+          currentDrop.errorCode,
+        );
+      if (status && applyProjection) {
         await tx.drop.update({
           where: { id: drop.id },
           data: {
             status,
             deliveredAt: status === "DELIVERED" ? now : undefined,
             failedAt: status === "FAILED" ? now : undefined,
-            optedOutAt: status === "OPTED_OUT" ? now : undefined,
+            optedOutAt:
+              status === "OPTED_OUT"
+                ? (currentDrop.optedOutAt ?? now)
+                : undefined,
             errorMessage: status === "FAILED" ? event.reason : undefined,
           },
         });
@@ -156,12 +211,53 @@ export async function processDropCowboyWebhook(raw: unknown) {
           data: { status: campaignContactStatus },
         });
       }
-      if (status === "OPTED_OUT") {
+      if (
+        applyProjection &&
+        currentDrop.status !== "DRY_RUN" &&
+        (status === "DELIVERED" || status === "FAILED")
+      ) {
+        await recordRvmDeliveryTx(tx, {
+          campaignContactId: drop.campaignContactId,
+          status,
+          occurredAt: now,
+          idempotencyKey: `delivery-event:${deliveryEvent.id}:${status.toLowerCase()}`,
+          rawPayload: event.raw,
+        });
+        if (status === "DELIVERED") {
+          const firstSuccess = await recordRvmSuccessUsageTx(tx, drop.id, now);
+          if (firstSuccess) {
+            const settings = await getAppSettings(tx);
+            const usageValue = Math.round(
+              settings.drop_cowboy_success_cost_cents,
+            );
+            await tx.drop.update({
+              where: { id: drop.id },
+              data: {
+                providerUsageValueCents: usageValue,
+                estimatedCostCents: usageValue,
+              },
+            });
+          }
+        }
+      }
+      if (applyProjection && status === "OPTED_OUT") {
+        await applyCallbackOutcomeToSequencesTx(tx, {
+          normalizedPhone: currentDrop.campaignContact.contact.normalizedPhone,
+          outcome: "OPT_OUT",
+          attributionChannel: "RVM_CALLBACK",
+          occurredAt: now,
+          idempotencyKey: `delivery-event:${deliveryEvent.id}:opt-out`,
+          creditedCampaignContactId: drop.campaignContactId,
+          rawPayload: event.raw,
+          source: "dropcowboy_webhook",
+        });
+      }
+      if (applyProjection && status === "OPTED_OUT") {
         const phone =
           event.phone ||
           (
             await tx.contact.findUnique({
-              where: { id: drop.campaignContact.contactId },
+              where: { id: currentDrop.campaignContact.contactId },
             })
           )?.normalizedPhone;
         if (phone) {
@@ -169,7 +265,7 @@ export async function processDropCowboyWebhook(raw: unknown) {
             where: { normalizedPhone: phone },
             create: {
               normalizedPhone: phone,
-              contactId: drop.campaignContact.contactId,
+              contactId: currentDrop.campaignContact.contactId,
               reason: event.dnc ? "PROVIDER_DNC" : "OPT_OUT",
               source: "dropcowboy_webhook",
             },
@@ -180,7 +276,11 @@ export async function processDropCowboyWebhook(raw: unknown) {
           });
         }
       }
-      return { duplicate: false, eventId: deliveryEvent.id };
+      return {
+        duplicate: false,
+        eventId: deliveryEvent.id,
+        appliedStatus: applyProjection ? status : null,
+      };
     });
   } catch (error) {
     if (
@@ -196,7 +296,11 @@ export async function processDropCowboyWebhook(raw: unknown) {
     }
     throw error;
   }
-  if (status === "DELIVERED" || status === "FAILED" || status === "OPTED_OUT") {
+  if (
+    result.appliedStatus === "DELIVERED" ||
+    result.appliedStatus === "FAILED" ||
+    result.appliedStatus === "OPTED_OUT"
+  ) {
     const active = await db.campaignContact.count({
       where: {
         campaignId: drop.campaignContact.campaignId,
@@ -211,5 +315,5 @@ export async function processDropCowboyWebhook(raw: unknown) {
       });
     }
   }
-  return result;
+  return { duplicate: result.duplicate, eventId: result.eventId };
 }

@@ -132,6 +132,37 @@ export async function POST(request: Request) {
           skipDuplicates: true,
         }),
       ]);
+      const campaignContacts = await db.campaignContact.findMany({
+        where: {
+          campaignId: campaign.id,
+          importRowId: { in: prepared.map(({ row }) => row.id) },
+        },
+        select: { id: true },
+      });
+      await db.outreachSequence.createMany({
+        data: campaignContacts.map(({ id }) => ({ campaignContactId: id })),
+        skipDuplicates: true,
+      });
+      const sequences = await db.outreachSequence.findMany({
+        where: {
+          campaignContactId: {
+            in: campaignContacts.map(({ id }) => id),
+          },
+        },
+        select: { id: true, campaignContactId: true, createdAt: true },
+      });
+      await db.outreachEvent.createMany({
+        data: sequences.map((sequence) => ({
+          sequenceId: sequence.id,
+          type: "RVM_PENDING",
+          channel: "RVM",
+          resultingState: "RVM_PENDING",
+          occurredAt: sequence.createdAt,
+          source: "campaign_import",
+          idempotencyKey: `sequence:${sequence.campaignContactId}:created`,
+        })),
+        skipDuplicates: true,
+      });
     } while (cursor);
     await db.$transaction([
       db.importBatch.update({

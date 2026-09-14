@@ -49,4 +49,27 @@ describe("webhook idempotency", () => {
     expect(first.occurredAt?.toISOString()).toBe("2023-11-14T22:13:20.000Z");
     expect(second.providerEventId).toBe(first.providerEventId);
   });
+
+  it("fails closed without a configured signing secret", async () => {
+    const { verifyDropCowboySignature } = await import("./webhooks");
+    expect(verifyDropCowboySignature("{}", null)).toBe(false);
+    expect(verifyDropCowboySignature("{}", "anything")).toBe(false);
+  });
+
+  it("keeps delivery projections monotonic for late provider events", async () => {
+    const { shouldApplyDropStatusTransition } = await import("./webhooks");
+    expect(shouldApplyDropStatusTransition("DELIVERED", "SENT")).toBe(false);
+    expect(shouldApplyDropStatusTransition("DELIVERED", "FAILED")).toBe(false);
+    expect(shouldApplyDropStatusTransition("FAILED", "DELIVERED")).toBe(false);
+    expect(
+      shouldApplyDropStatusTransition(
+        "FAILED",
+        "DELIVERED",
+        "RVM_SUBMISSION_UNKNOWN",
+      ),
+    ).toBe(true);
+    expect(shouldApplyDropStatusTransition("DELIVERED", "OPTED_OUT")).toBe(
+      true,
+    );
+  });
 });

@@ -1,9 +1,14 @@
-import { Prisma } from "@prisma/client";
+import {
+  type AttributionChannel,
+  type CallbackOutcomeType,
+  Prisma,
+} from "@prisma/client";
 import { z } from "zod";
 import { lookupCallback } from "@/lib/callback-matching";
 import { db } from "@/lib/db";
 import { getEnv } from "@/lib/env";
 import { normalizeUSPhone } from "@/lib/phone";
+import { applyCallbackOutcomeToSequencesTx } from "@/lib/outreach-service";
 
 export const callbackResultSchema = z.object({
   idempotency_key: z.string().min(8).max(200),
@@ -26,6 +31,9 @@ export const callbackResultSchema = z.object({
   callback_timestamp: z.iso.datetime().optional(),
   contract_amount_cents: z.number().int().nonnegative().optional(),
   revenue_cents: z.number().int().nonnegative().optional(),
+  attribution_channel: z
+    .enum(["rvm_callback", "sms", "cold_call", "other"])
+    .default("rvm_callback"),
 });
 
 const outcomeMap = {
@@ -40,6 +48,57 @@ const outcomeMap = {
   closed: "CLOSED",
 } as const;
 
+const attributionMap = {
+  rvm_callback: "RVM_CALLBACK",
+  sms: "SMS",
+  cold_call: "COLD_CALL",
+  other: "OTHER",
+} as const;
+
+type ParsedCallbackResult = z.infer<typeof callbackResultSchema>;
+
+function callbackCommandIdentity(
+  input: ParsedCallbackResult,
+  normalizedPhone: string,
+) {
+  return JSON.stringify({
+    normalizedPhone,
+    outcome: outcomeMap[input.outcome],
+    attributionChannel: attributionMap[input.attribution_channel],
+    campaignId: input.campaign_id ?? null,
+    campaignContactId: input.campaign_contact_id ?? null,
+    stonegateLeadId: input.stonegate_os_lead_id ?? null,
+    summary: input.callback_summary ?? null,
+    callbackTimestamp: input.callback_timestamp ?? null,
+    contractAmountCents: input.contract_amount_cents ?? null,
+    revenueCents: input.revenue_cents ?? null,
+  });
+}
+
+function assertMatchingCallbackRetry(
+  existing: {
+    normalizedPhone: string;
+    outcome: CallbackOutcomeType;
+    attributionChannel: AttributionChannel;
+    rawPayload: Prisma.JsonValue | null;
+  },
+  input: ParsedCallbackResult,
+  normalizedPhone: string,
+) {
+  const parsed = callbackResultSchema.safeParse(existing.rawPayload);
+  const sameRawCommand =
+    parsed.success &&
+    normalizeUSPhone(parsed.data.phone) === normalizedPhone &&
+    callbackCommandIdentity(parsed.data, normalizedPhone) ===
+      callbackCommandIdentity(input, normalizedPhone);
+  const sameCore =
+    existing.normalizedPhone === normalizedPhone &&
+    existing.outcome === outcomeMap[input.outcome] &&
+    existing.attributionChannel === attributionMap[input.attribution_channel];
+  if (!(parsed.success ? sameRawCommand : sameCore))
+    throw new Error("Idempotency key was already used for another callback");
+}
+
 export async function recordCallbackOutcome(
   raw: unknown,
   lookbackDays = getEnv().CALLBACK_LOOKBACK_DAYS,
@@ -51,7 +110,10 @@ export async function recordCallbackOutcome(
   const duplicate = await db.callbackOutcome.findUnique({
     where: { idempotencyKey: input.idempotency_key },
   });
-  if (duplicate) return { result: duplicate, duplicate: true };
+  if (duplicate) {
+    assertMatchingCallbackRetry(duplicate, input, normalizedPhone);
+    return { result: duplicate, duplicate: true };
+  }
 
   let campaignId = input.campaign_id;
   let campaignContactId = input.campaign_contact_id;
@@ -77,48 +139,40 @@ export async function recordCallbackOutcome(
     if (candidates.length === 1) {
       campaignContactId = candidates[0].campaignContactId;
       campaignId = candidates[0].drop.campaignContact.campaignId;
-    } else if (candidates.length > 1) {
-      throw new Error(
-        "Callback attribution is ambiguous; provide campaign_contact_id",
-      );
     }
   }
 
   try {
     const result = await db.$transaction(async (tx) => {
+      const callbackAt = input.callback_timestamp
+        ? new Date(input.callback_timestamp)
+        : new Date();
       const outcome = await tx.callbackOutcome.create({
         data: {
           idempotencyKey: input.idempotency_key,
           normalizedPhone,
           outcome: outcomeMap[input.outcome],
+          attributionChannel: attributionMap[input.attribution_channel],
           campaignId,
           campaignContactId,
           stonegateLeadId: input.stonegate_os_lead_id,
           summary: input.callback_summary,
-          callbackAt: input.callback_timestamp
-            ? new Date(input.callback_timestamp)
-            : new Date(),
+          callbackAt,
           contractAmountCents: input.contract_amount_cents,
           revenueCents: input.revenue_cents,
           rawPayload: raw as Prisma.InputJsonValue,
         },
       });
-      if (input.outcome === "opt_out") {
-        const contact = await tx.contact.findUnique({
-          where: { normalizedPhone },
-          select: { id: true },
-        });
-        await tx.suppressionEntry.upsert({
-          where: { normalizedPhone },
-          create: {
-            normalizedPhone,
-            contactId: contact?.id,
-            reason: "OPT_OUT",
-            source: "stonegate_callback_ai",
-          },
-          update: { reason: "OPT_OUT", source: "stonegate_callback_ai" },
-        });
-      }
+      await applyCallbackOutcomeToSequencesTx(tx, {
+        normalizedPhone,
+        outcome: outcomeMap[input.outcome],
+        attributionChannel: attributionMap[input.attribution_channel],
+        occurredAt: callbackAt,
+        idempotencyKey: input.idempotency_key,
+        creditedCampaignContactId: campaignContactId,
+        rawPayload: raw,
+        source: "stonegate_callback_ai",
+      });
       return outcome;
     });
     return { result, duplicate: false };
@@ -132,7 +186,10 @@ export async function recordCallbackOutcome(
       const raced = await db.callbackOutcome.findUnique({
         where: { idempotencyKey: input.idempotency_key },
       });
-      if (raced) return { result: raced, duplicate: true };
+      if (raced) {
+        assertMatchingCallbackRetry(raced, input, normalizedPhone);
+        return { result: raced, duplicate: true };
+      }
     }
     throw error;
   }

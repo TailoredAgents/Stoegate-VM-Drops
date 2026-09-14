@@ -40,6 +40,7 @@ const valid = {
     objectKey: "campaign/audio.mp3",
     contentType: "audio/mpeg",
     generatedAt: new Date(),
+    billingDisposition: "BILLABLE_GENERATION" as const,
   },
   drop: { status: "PENDING" as const, queuedAt: null },
   callbackUrl: "https://drops.example/api/webhooks/dropcowboy",
@@ -78,5 +79,16 @@ describe("server-side live send guards", () => {
         drop: { status: "FAILED", queuedAt: new Date() },
       }),
     ).rejects.toThrow("already has a submission attempt");
+  });
+
+  it("rejects a dry-run preview asset before provider access", async () => {
+    const { assertLiveSendPreconditions } = await import("./live-send-guards");
+    await expect(
+      assertLiveSendPreconditions({
+        ...valid,
+        audio: { ...valid.audio, billingDisposition: "DRY_RUN" },
+      }),
+    ).rejects.toThrow("audio is not ready");
+    expect(assertReadyForLiveSend).not.toHaveBeenCalled();
   });
 });

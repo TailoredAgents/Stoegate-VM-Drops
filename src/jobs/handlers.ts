@@ -5,6 +5,16 @@ import { db } from "@/lib/db";
 import { getEnv } from "@/lib/env";
 import { getNumericSettings } from "@/lib/settings";
 import { assertLiveSendPreconditions } from "@/lib/live-send-guards";
+import {
+  ensureOutreachSequence,
+  markRvmScheduled,
+  reconcileDueOutreach,
+  recordRvmSubmissionUncertainTx,
+} from "@/lib/outreach-service";
+import {
+  reserveLiveRvmAttempt,
+  RvmAttemptDeferredError,
+} from "@/lib/rvm-operations";
 import { renderVoicemailTemplate } from "@/lib/templates";
 import { sha256 } from "@/lib/utils";
 import { getProviders } from "@/providers";
@@ -27,7 +37,7 @@ const sendSchema = z.object({
 
 async function recordJobStart(
   job: Job<unknown>,
-  campaignId: string,
+  campaignId?: string,
   entityId?: string,
 ) {
   await db.jobRun.upsert({
@@ -143,6 +153,9 @@ export async function handlePrepareCampaign(job: Job<unknown>) {
       }
       for (const contact of [...unfinished, ...contacts])
         await enqueueGenerateAudio(campaign.id, contact.id, false);
+      await markRvmScheduled(
+        [...unfinished, ...contacts].map((contact) => contact.id),
+      );
       if (unfinished.length + contacts.length === 0)
         await maybeCompleteCampaign(campaign.id);
     }
@@ -211,8 +224,12 @@ export async function handleGenerateAudio(job: Job<unknown>) {
       script.body,
       templateContext(cc),
     );
+    const voiceSettings =
+      voice.settings && typeof voice.settings === "object"
+        ? (voice.settings as Record<string, unknown>)
+        : undefined;
     const textHash = sha256(
-      `${renderedText}\0${voice.voiceId}\0${voice.modelId}`,
+      `${renderedText}\0${voice.voiceId}\0${voice.modelId}\0${getEnv().ELEVENLABS_OUTPUT_FORMAT}\0${JSON.stringify(voiceSettings ?? {})}`,
     );
     const existing = await db.audioAsset.findUnique({
       where: {
@@ -224,7 +241,29 @@ export async function handleGenerateAudio(job: Job<unknown>) {
         },
       },
     });
-    if (existing?.status === "READY") {
+    const needsLiveAudio = getEnv().AUDIO_GENERATION_LIVE_ENABLED;
+    const storedLiveGeneration =
+      existing?.status === "READY" && needsLiveAudio
+        ? await db.audioGenerationUsage.findFirst({
+            where: {
+              audioAssetId: existing.id,
+              billingDisposition: "BILLABLE_GENERATION",
+              storedAt: { not: null },
+              storageError: null,
+            },
+            select: { id: true },
+          })
+        : null;
+    const canReuse =
+      existing?.status === "READY" &&
+      (!needsLiveAudio ||
+        (existing.billingDisposition === "BILLABLE_GENERATION" &&
+          Boolean(storedLiveGeneration)));
+    if (canReuse && existing) {
+      await db.audioAsset.update({
+        where: { id: existing.id },
+        data: { reuseCount: { increment: 1 } },
+      });
       if (!data.preview)
         await enqueueSendDrop(data.campaignId, cc.id, existing.id);
       await finalizePreview(data.campaignId);
@@ -254,23 +293,51 @@ export async function handleGenerateAudio(job: Job<unknown>) {
       text: renderedText,
       voiceId: voice.voiceId,
       modelId: voice.modelId,
-      settings:
-        voice.settings && typeof voice.settings === "object"
-          ? (voice.settings as Record<string, unknown>)
-          : undefined,
+      settings: voiceSettings,
+    });
+    const settings = await getNumericSettings();
+    const billableGeneration = tts.name !== "dry-run-tts";
+    const estimatedCostCents = billableGeneration
+      ? Math.round(
+          (generated.characterCount / 1000) *
+            settings.elevenlabs_cost_per_1000_chars_cents,
+        )
+      : 0;
+    const generatedAt = new Date();
+    const usage = await db.audioGenerationUsage.create({
+      data: {
+        audioAssetId: asset.id,
+        provider: tts.name,
+        providerGenerationId: generated.providerGenerationId,
+        characterCount: generated.characterCount,
+        estimatedCostCents,
+        billingDisposition: billableGeneration
+          ? "BILLABLE_GENERATION"
+          : "DRY_RUN",
+        generatedAt,
+      },
     });
     const extension = generated.contentType.includes("wav") ? "wav" : "mp3";
     const objectKey = `campaigns/${cc.campaignId}/contacts/${cc.id}/${textHash}.${extension}`;
-    await storage.put({
-      key: objectKey,
-      bytes: generated.bytes,
-      contentType: generated.contentType,
-    });
-    const settings = await getNumericSettings();
-    const estimatedCostCents = Math.round(
-      (generated.characterCount / 1000) *
-        settings.elevenlabs_cost_per_1000_chars_cents,
-    );
+    try {
+      await storage.put({
+        key: objectKey,
+        bytes: generated.bytes,
+        contentType: generated.contentType,
+      });
+      await db.audioGenerationUsage.update({
+        where: { id: usage.id },
+        data: { storedAt: new Date() },
+      });
+    } catch (error) {
+      await db.audioGenerationUsage.update({
+        where: { id: usage.id },
+        data: {
+          storageError: error instanceof Error ? error.message : String(error),
+        },
+      });
+      throw error;
+    }
     const ready = await db.audioAsset.update({
       where: { id: asset.id },
       data: {
@@ -281,7 +348,10 @@ export async function handleGenerateAudio(job: Job<unknown>) {
         providerGenerationId: generated.providerGenerationId,
         durationSeconds: generated.durationSeconds,
         estimatedCostCents,
-        generatedAt: new Date(),
+        billingDisposition: billableGeneration
+          ? "BILLABLE_GENERATION"
+          : "DRY_RUN",
+        generatedAt,
       },
     });
     await db.campaignContact.update({
@@ -292,11 +362,19 @@ export async function handleGenerateAudio(job: Job<unknown>) {
     else await enqueueSendDrop(data.campaignId, cc.id, ready.id);
     await recordJobFinish(job);
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    await db.audioAsset.updateMany({
+      where: {
+        campaignContactId: data.campaignContactId,
+        status: "GENERATING",
+      },
+      data: { status: "FAILED", errorMessage },
+    });
     await db.campaignContact.updateMany({
       where: { id: data.campaignContactId },
       data: {
         status: "FAILED",
-        errorMessage: error instanceof Error ? error.message : String(error),
+        errorMessage,
       },
     });
     await recordJobFinish(job, error);
@@ -325,6 +403,9 @@ async function finalizePreview(campaignId: string) {
 
 export async function handleSendDrop(job: Job<unknown>) {
   const data = sendSchema.parse(job.data);
+  let committedLiveReservation:
+    { dropId: string; campaignContactId: string } | undefined;
+  let providerResultPersisted = false;
   await recordJobStart(job, data.campaignId, data.campaignContactId);
   try {
     const cc = await db.campaignContact.findUniqueOrThrow({
@@ -383,9 +464,10 @@ export async function handleSendDrop(job: Job<unknown>) {
     drop ??= await db.drop.create({
       data: { campaignContactId: cc.id, audioAssetId: audio.id },
     });
+    await ensureOutreachSequence(cc.id);
     await db.campaignContact.update({
       where: { id: cc.id },
-      data: { status: "SENDING" },
+      data: { status: "SENDING", errorCode: null, errorMessage: null },
     });
     const { storage, rvm } = getProviders();
     const audioUrl = await storage.getReadUrl(audio.objectKey);
@@ -406,10 +488,37 @@ export async function handleSendDrop(job: Job<unknown>) {
       rvm,
     });
     if (rvm.live) {
-      await db.drop.update({
-        where: { id: drop.id },
-        data: { queuedAt: new Date() },
-      });
+      try {
+        const reservation = await reserveLiveRvmAttempt({
+          dropId: drop.id,
+          campaignContactId: cc.id,
+          audioAssetId: audio.id,
+        });
+        if (!reservation.reserved) {
+          await recordJobFinish(job);
+          return;
+        }
+        committedLiveReservation = {
+          dropId: drop.id,
+          campaignContactId: cc.id,
+        };
+      } catch (error) {
+        if (error instanceof RvmAttemptDeferredError) {
+          await db.campaignContact.update({
+            where: { id: cc.id },
+            data: { status: "AUDIO_READY" },
+          });
+          await enqueueSendDrop(
+            data.campaignId,
+            cc.id,
+            audio.id,
+            error.nextAllowedAt,
+          );
+          await recordJobFinish(job);
+          return;
+        }
+        throw error;
+      }
     }
     const result = await rvm.send({
       foreignId: drop.id,
@@ -424,46 +533,115 @@ export async function handleSendDrop(job: Job<unknown>) {
       postalCode: cc.property?.postalCode ?? undefined,
       callbackUrl,
     });
-    const estimatedCost = (await getNumericSettings())
-      .rvm_cost_per_delivered_drop_cents;
-    await db.drop.update({
-      where: { id: drop.id },
-      data: {
-        status:
-          result.status === "dry_run"
-            ? "DRY_RUN"
-            : result.status === "sent"
-              ? "SENT"
-              : "QUEUED",
-        providerMessageId: result.providerMessageId,
-        providerResponse: result.rawResponse as Prisma.InputJsonValue,
-        estimatedCostCents: result.status === "dry_run" ? 0 : estimatedCost,
-        queuedAt: drop.queuedAt ?? new Date(),
-        sentAt: result.status === "sent" ? new Date() : undefined,
-      },
+    await db.$transaction(async (tx) => {
+      const persisted = await tx.drop.updateMany({
+        where: {
+          id: drop.id,
+          status: {
+            notIn: ["DELIVERED", "FAILED", "OPTED_OUT", "SKIPPED"],
+          },
+        },
+        data: {
+          status:
+            result.status === "dry_run"
+              ? "DRY_RUN"
+              : result.status === "sent"
+                ? "SENT"
+                : "QUEUED",
+          providerMessageId: result.providerMessageId,
+          providerResponse: result.rawResponse as Prisma.InputJsonValue,
+          estimatedCostCents: 0,
+          queuedAt: rvm.live ? undefined : (drop.queuedAt ?? new Date()),
+          sentAt: result.status === "sent" ? new Date() : undefined,
+        },
+      });
+      if (persisted.count > 0) {
+        await tx.campaignContact.updateMany({
+          where: {
+            id: cc.id,
+            status: { in: ["SENDING", "QUEUED"] },
+          },
+          data: {
+            status: result.status === "dry_run" ? "SKIPPED" : "QUEUED",
+          },
+        });
+      }
     });
-    await db.campaignContact.update({
-      where: { id: cc.id },
-      data: { status: result.status === "dry_run" ? "SKIPPED" : "QUEUED" },
-    });
+    providerResultPersisted = true;
     await maybeCompleteCampaign(data.campaignId);
     await recordJobFinish(job);
   } catch (error) {
-    await db.campaignContact.updateMany({
-      where: { id: data.campaignContactId },
-      data: {
-        status: "FAILED",
-        errorMessage: error instanceof Error ? error.message : String(error),
-      },
-    });
-    await db.drop.updateMany({
-      where: { campaignContactId: data.campaignContactId },
-      data: {
-        status: "FAILED",
-        failedAt: new Date(),
-        errorMessage: error instanceof Error ? error.message : String(error),
-      },
-    });
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const failedAt = new Date();
+    const committed = committedLiveReservation;
+    if (committed && !providerResultPersisted) {
+      await db.$transaction(async (tx) => {
+        const failedDrop = await tx.drop.updateMany({
+          where: {
+            id: committed.dropId,
+            status: {
+              notIn: ["DELIVERED", "FAILED", "OPTED_OUT", "SKIPPED"],
+            },
+          },
+          data: {
+            status: "FAILED",
+            failedAt,
+            errorCode: "RVM_SUBMISSION_UNKNOWN",
+            errorMessage,
+          },
+        });
+        if (failedDrop.count > 0) {
+          await tx.campaignContact.updateMany({
+            where: {
+              id: committed.campaignContactId,
+              status: { in: ["SENDING", "QUEUED"] },
+            },
+            data: {
+              status: "FAILED",
+              errorCode: "RVM_SUBMISSION_UNKNOWN",
+              errorMessage,
+            },
+          });
+        }
+        await recordRvmSubmissionUncertainTx(tx, {
+          campaignContactId: committed.campaignContactId,
+          occurredAt: failedAt,
+          idempotencyKey: `drop:${committed.dropId}:submission-unknown`,
+          errorMessage,
+        });
+      });
+    } else if (!providerResultPersisted) {
+      await db.campaignContact.updateMany({
+        where: { id: data.campaignContactId },
+        data: {
+          status: "FAILED",
+          errorMessage,
+        },
+      });
+      await db.drop.updateMany({
+        where: { campaignContactId: data.campaignContactId, queuedAt: null },
+        data: {
+          status: "FAILED",
+          failedAt,
+          errorMessage,
+        },
+      });
+    }
+    await recordJobFinish(job, error);
+    throw error;
+  }
+}
+
+export async function handleReconcileOutreach(job: Job<unknown>) {
+  await recordJobStart(job);
+  try {
+    let examined = 0;
+    do {
+      const result = await reconcileDueOutreach(new Date(), 500);
+      examined = result.examined;
+    } while (examined === 500);
+    await recordJobFinish(job);
+  } catch (error) {
     await recordJobFinish(job, error);
     throw error;
   }

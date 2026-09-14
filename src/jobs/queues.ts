@@ -6,6 +6,7 @@ export const QUEUES = {
   prepareCampaign: "campaign-prepare",
   generateAudio: "audio-generate",
   sendDrop: "rvm-send",
+  reconcileOutreach: "outreach-reconcile",
 } as const;
 
 let boss: PgBoss | undefined;
@@ -33,6 +34,12 @@ export function startBoss(): Promise<PgBoss> {
         retryDelayMax: 1800,
       });
     }
+    await instance.schedule(
+      QUEUES.reconcileOutreach,
+      "* * * * *",
+      {},
+      { tz: "UTC", missed: "once" },
+    );
     return instance;
   })();
   return started;
@@ -67,11 +74,17 @@ export async function enqueueSendDrop(
   campaignId: string,
   campaignContactId: string,
   audioAssetId: string,
+  startAfter?: Date,
 ) {
   const instance = await startBoss();
   return instance.send(
     QUEUES.sendDrop,
     { campaignId, campaignContactId, audioAssetId },
-    { singletonKey: campaignContactId },
+    {
+      singletonKey: startAfter
+        ? `${campaignContactId}:${startAfter.toISOString()}`
+        : campaignContactId,
+      startAfter,
+    },
   );
 }

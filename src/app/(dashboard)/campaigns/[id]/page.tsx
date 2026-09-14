@@ -10,7 +10,7 @@ import { notFound } from "next/navigation";
 import { CampaignActionPanel } from "@/components/campaign-action-panel";
 import { MetricCard } from "@/components/metric-card";
 import { StatusBadge } from "@/components/status-badge";
-import { getCampaignMetrics } from "@/lib/analytics";
+import { getCampaignMetrics, getOutreachFunnel } from "@/lib/analytics";
 import { db } from "@/lib/db";
 import { getNumericSettings } from "@/lib/settings";
 import { formatCents } from "@/lib/utils";
@@ -24,7 +24,7 @@ export default async function CampaignDetailPage({
 }) {
   const { id } = await params;
   const page = Math.max(1, Number((await searchParams).page) || 1);
-  const [campaign, metrics, settings] = await Promise.all([
+  const [campaign, metrics, settings, funnel] = await Promise.all([
     db.campaign.findUnique({
       where: { id },
       include: {
@@ -43,12 +43,15 @@ export default async function CampaignDetailPage({
               take: 1,
             },
             drops: { take: 1 },
+            outreachSequence: true,
+            leadAttribution: true,
           },
         },
       },
     }),
     getCampaignMetrics(id),
     getNumericSettings(),
+    getOutreachFunnel(id),
   ]);
   if (!campaign) notFound();
   const previews = await db.campaignContact.findMany({
@@ -77,9 +80,12 @@ export default async function CampaignDetailPage({
     ((averageCharacters * maxSends) / 1000) *
       settings.elevenlabs_cost_per_1000_chars_cents +
       maxSends *
-        (settings.rvm_cost_per_delivered_drop_cents +
-          settings.compliance_cost_per_message_cents),
+        (settings.drop_cowboy_success_cost_cents +
+          (settings.carrier_average_seconds_per_attempt / 60) *
+            settings.carrier_voice_cents_per_minute),
   );
+  const optionalCents = (value: number | null) =>
+    value == null ? "—" : formatCents(value);
   return (
     <>
       <Link
@@ -105,7 +111,7 @@ export default async function CampaignDetailPage({
         </div>
         <div className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-right">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-            Estimated max spend
+            Estimated marginal usage
           </p>
           <p className="text-xl font-bold">{formatCents(estimatedCost)}</p>
         </div>
@@ -126,7 +132,7 @@ export default async function CampaignDetailPage({
         <MetricCard
           label="Qualified leads"
           value={metrics.qualified.toLocaleString()}
-          detail={`${metrics.callbackToQualifiedRate.toFixed(1)}% of callbacks`}
+          detail={`${funnel.rvm.qualifiedLeads.toLocaleString()} RVM · ${funnel.sms.qualifiedLeads.toLocaleString()} SMS · ${funnel.coldCall.qualifiedLeads.toLocaleString()} cold-call`}
           icon={Target}
         />
         <MetricCard
@@ -139,6 +145,107 @@ export default async function CampaignDetailPage({
           }
           icon={BadgeDollarSign}
         />
+      </section>
+      <section className="mt-6 grid gap-5 xl:grid-cols-[1.2fr_1fr]">
+        <div className="table-wrap overflow-x-auto">
+          <table className="data-table min-w-[650px]">
+            <thead>
+              <tr>
+                <th>Touch</th>
+                <th>Eligible / attempted</th>
+                <th>Sent / successful</th>
+                <th>Responses</th>
+                <th>Credited leads</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td className="font-semibold">RVM</td>
+                <td>{funnel.rvm.attempted.toLocaleString()}</td>
+                <td>{funnel.rvm.successful.toLocaleString()}</td>
+                <td>{funnel.rvm.callbacks.toLocaleString()} callbacks</td>
+                <td>{funnel.rvm.qualifiedLeads.toLocaleString()}</td>
+              </tr>
+              <tr>
+                <td className="font-semibold">External SMS</td>
+                <td>{funnel.sms.eligible.toLocaleString()}</td>
+                <td>{funnel.sms.sent.toLocaleString()}</td>
+                <td>{funnel.sms.replies.toLocaleString()} replies</td>
+                <td>{funnel.sms.qualifiedLeads.toLocaleString()}</td>
+              </tr>
+              <tr>
+                <td className="font-semibold">Human cold call</td>
+                <td>{funnel.coldCall.eligible.toLocaleString()}</td>
+                <td>{funnel.coldCall.exported.toLocaleString()} exported</td>
+                <td>{funnel.coldCall.contacted.toLocaleString()} contacted</td>
+                <td>{funnel.coldCall.qualifiedLeads.toLocaleString()}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div className="card divide-y divide-slate-100 px-5">
+          {[
+            ["ElevenLabs generation", formatCents(metrics.ttsCents)],
+            [
+              "ElevenLabs characters",
+              metrics.elevenLabsCharacters.toLocaleString(),
+            ],
+            [
+              "Audio generations / reuses",
+              `${metrics.audioGenerated.toLocaleString()} / ${metrics.audioReuseCount.toLocaleString()}`,
+            ],
+            [
+              "Drop Cowboy marginal usage",
+              formatCents(metrics.marginalDropCowboyCents),
+            ],
+            [
+              "Allocated Drop Cowboy invoice",
+              formatCents(metrics.allocatedDropCowboyCents),
+            ],
+            ["Allocated carrier fixed", formatCents(metrics.carrierFixedCents)],
+            ["Carrier usage", formatCents(metrics.carrierVariableCents)],
+            ["Carrier total", formatCents(metrics.carrierTotalCents)],
+            [
+              "Infrastructure allocation",
+              formatCents(metrics.infrastructureCents),
+            ],
+            ["Total attributable", formatCents(metrics.totalCents)],
+            [
+              "Cost / attempted RVM",
+              optionalCents(metrics.costPerAttemptedCents),
+            ],
+            [
+              "Cost / successful RVM",
+              optionalCents(metrics.costPerDeliveredCents),
+            ],
+            ["Cost / callback", optionalCents(metrics.costPerCallbackCents)],
+            [
+              "Cost / interested seller",
+              optionalCents(metrics.costPerInterestedCents),
+            ],
+            [
+              "Cost / qualified lead",
+              optionalCents(metrics.costPerQualifiedLeadCents),
+            ],
+            ["Cost / contract", optionalCents(metrics.costPerContractCents)],
+            [
+              "Cost / closed deal",
+              optionalCents(metrics.actualCostPerClosedDealCents),
+            ],
+          ].map(([label, value]) => (
+            <div
+              className="flex items-center justify-between py-3"
+              key={String(label)}
+            >
+              <span className="text-sm text-slate-600">{label}</span>
+              <strong className="text-right text-sm">{value}</strong>
+            </div>
+          ))}
+          <p className="py-3 text-xs leading-5 text-slate-500">
+            Marginal usage is informational and is not added again to the
+            allocated monthly invoice cost.
+          </p>
+        </div>
       </section>
       <section className="mt-6 grid gap-5 xl:grid-cols-[1fr_330px]">
         <div className="space-y-5">
@@ -254,6 +361,7 @@ export default async function CampaignDetailPage({
                 <th>Property</th>
                 <th>Audio</th>
                 <th>Drop</th>
+                <th>Sequence</th>
               </tr>
             </thead>
             <tbody>
@@ -284,6 +392,22 @@ export default async function CampaignDetailPage({
                   </td>
                   <td>
                     <StatusBadge status={cc.drops[0]?.status ?? cc.status} />
+                  </td>
+                  <td>
+                    <StatusBadge
+                      status={
+                        cc.outreachSequence?.currentState ?? "NOT_ENROLLED"
+                      }
+                    />
+                    {cc.leadAttribution ? (
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        Lead:{" "}
+                        {cc.leadAttribution.creditedChannel.replaceAll(
+                          "_",
+                          " ",
+                        )}
+                      </p>
+                    ) : null}
                   </td>
                 </tr>
               ))}

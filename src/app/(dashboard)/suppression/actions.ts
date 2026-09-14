@@ -3,11 +3,11 @@
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { requireUser } from "@/lib/auth";
-import { db } from "@/lib/db";
 import { normalizeUSPhone } from "@/lib/phone";
+import { suppressPhoneAndExit } from "@/lib/outreach-service";
 
 export async function addSuppressionAction(formData: FormData) {
-  await requireUser();
+  const user = await requireUser();
   const input = z
     .object({
       phone: z.string(),
@@ -23,20 +23,12 @@ export async function addSuppressionAction(formData: FormData) {
     .parse(Object.fromEntries(formData));
   const normalizedPhone = normalizeUSPhone(input.phone);
   if (!normalizedPhone) throw new Error("Enter a valid US phone number");
-  const contact = await db.contact.findUnique({
-    where: { normalizedPhone },
-    select: { id: true },
-  });
-  await db.suppressionEntry.upsert({
-    where: { normalizedPhone },
-    create: {
-      normalizedPhone,
-      contactId: contact?.id,
-      reason: input.reason,
-      notes: input.notes,
-      source: "manual",
-    },
-    update: { reason: input.reason, notes: input.notes },
+  await suppressPhoneAndExit({
+    normalizedPhone,
+    reason: input.reason,
+    notes: input.notes,
+    source: "manual",
+    actorUserId: user.id,
   });
   revalidatePath("/suppression");
 }

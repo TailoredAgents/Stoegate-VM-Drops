@@ -1,4 +1,9 @@
-import type { AudioStatus, CampaignStatus, DropStatus } from "@prisma/client";
+import type {
+  AudioBillingDisposition,
+  AudioStatus,
+  CampaignStatus,
+  DropStatus,
+} from "@prisma/client";
 import { db } from "@/lib/db";
 import { getEnv } from "@/lib/env";
 import { normalizeUSPhone } from "@/lib/phone";
@@ -24,6 +29,7 @@ interface LiveSendGuardInput {
     objectKey: string | null;
     contentType: string;
     generatedAt: Date | null;
+    billingDisposition: AudioBillingDisposition;
   };
   drop: { status: DropStatus; queuedAt: Date | null };
   callbackUrl: string;
@@ -82,6 +88,7 @@ export async function assertLiveSendPreconditions(
   if (
     input.audio.campaignContactId !== input.campaignContact.id ||
     input.audio.status !== "READY" ||
+    input.audio.billingDisposition !== "BILLABLE_GENERATION" ||
     !input.audio.objectKey ||
     !input.audio.generatedAt ||
     !["audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav"].includes(

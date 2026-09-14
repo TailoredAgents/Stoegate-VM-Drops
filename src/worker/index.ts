@@ -3,6 +3,7 @@ import { logger } from "@/lib/logger";
 import {
   handleGenerateAudio,
   handlePrepareCampaign,
+  handleReconcileOutreach,
   handleSendDrop,
 } from "@/jobs/handlers";
 import { getBoss, QUEUES, startBoss } from "@/jobs/queues";
@@ -19,6 +20,11 @@ async function main() {
   );
   await boss.work(QUEUES.sendDrop, workerOptions, async (jobs) =>
     Promise.all(jobs.map(handleSendDrop)),
+  );
+  await boss.work(
+    QUEUES.reconcileOutreach,
+    { localConcurrency: 1 },
+    async (jobs) => Promise.all(jobs.map(handleReconcileOutreach)),
   );
   logger.info(
     {

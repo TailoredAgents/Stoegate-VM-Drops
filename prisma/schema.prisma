@@ -60,6 +60,11 @@ enum AudioStatus {
   FAILED
 }
 
+enum AudioBillingDisposition {
+  BILLABLE_GENERATION
+  DRY_RUN
+}
+
 enum DropStatus {
   PENDING
   DRY_RUN
@@ -83,6 +88,98 @@ enum CallbackOutcomeType {
   CLOSED
 }
 
+enum AttributionChannel {
+  RVM_CALLBACK
+  SMS
+  COLD_CALL
+  OTHER
+}
+
+enum OutreachChannel {
+  RVM
+  SMS
+  COLD_CALL
+  SYSTEM
+}
+
+enum OutreachSequenceState {
+  RVM_PENDING
+  RVM_SENT
+  RVM_SUCCESS
+  RVM_FAILED
+  RVM_CALLBACK
+  RVM_NO_RESPONSE
+  SMS_NOT_YET_ELIGIBLE
+  SMS_ELIGIBLE
+  SMS_EXPORTED
+  SMS_SENT_EXTERNAL
+  SMS_REPLIED
+  SMS_FAILED
+  SMS_NO_RESPONSE
+  COLD_CALL_NOT_YET_ELIGIBLE
+  COLD_CALL_ELIGIBLE
+  COLD_CALL_EXPORTED
+  COLD_CALL_CONTACTED
+  COLD_CALL_NO_ANSWER
+  INTERESTED
+  QUALIFIED_LEAD
+  FOLLOW_UP
+  NOT_INTERESTED
+  WRONG_NUMBER
+  OPT_OUT
+  CONTRACT
+  CLOSED
+}
+
+enum OutreachEventType {
+  RVM_PENDING
+  RVM_SENT
+  RVM_SUCCESS
+  RVM_FAILED
+  RVM_CALLBACK
+  RVM_NO_RESPONSE
+  SMS_ELIGIBLE
+  SMS_EXPORTED
+  SMS_SENT_EXTERNAL
+  SMS_REPLIED
+  SMS_FAILED
+  SMS_NO_RESPONSE
+  COLD_CALL_ELIGIBLE
+  COLD_CALL_EXPORTED
+  COLD_CALL_CONTACTED
+  COLD_CALL_NO_ANSWER
+  OUTCOME_RECORDED
+  SEQUENCE_EXITED
+}
+
+enum OutreachExportType {
+  SMS_ELIGIBILITY
+  BATCH_DIALER
+}
+
+enum ExternalOutcomeChannel {
+  SMS
+  COLD_CALL
+}
+
+enum ExternalOutcomeImportStatus {
+  PROCESSING
+  COMPLETED
+  PARTIAL
+  FAILED
+}
+
+enum ExternalOutcomeRowStatus {
+  ACCEPTED
+  REJECTED
+  DUPLICATE
+}
+
+enum RvmUsageKind {
+  ATTEMPT
+  SUCCESS
+}
+
 enum SuppressionReason {
   OPT_OUT
   MANUAL
@@ -92,15 +189,18 @@ enum SuppressionReason {
 }
 
 model User {
-  id           String    @id @default(uuid()) @db.Uuid
-  email        String    @unique
-  passwordHash String
-  role         UserRole  @default(ADMIN)
-  active       Boolean   @default(true)
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-  sessions     Session[]
-  launchedCampaigns Campaign[] @relation("CampaignLaunchedBy")
+  id                     String                  @id @default(uuid()) @db.Uuid
+  email                  String                  @unique
+  passwordHash           String
+  role                   UserRole                @default(ADMIN)
+  active                 Boolean                 @default(true)
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+  sessions               Session[]
+  launchedCampaigns      Campaign[]              @relation("CampaignLaunchedBy")
+  outreachEvents         OutreachEvent[]         @relation("OutreachEventActor")
+  outreachExports        OutreachExport[]        @relation("OutreachExportCreator")
+  externalOutcomeImports ExternalOutcomeImport[] @relation("ExternalOutcomeImportCreator")
 }
 
 model Session {
@@ -120,7 +220,7 @@ model Campaign {
   id                      String                 @id @default(uuid()) @db.Uuid
   name                    String
   status                  CampaignStatus         @default(DRAFT)
-  sendLimit               Int                    @default(1000)
+  sendLimit               Int                    @default(2000)
   uploadedCount           Int                    @default(0)
   eligibleCount           Int                    @default(0)
   invalidCount            Int                    @default(0)
@@ -140,6 +240,8 @@ model Campaign {
   contacts                CampaignContact[]
   imports                 ImportBatch[]
   callbackOutcomes        CallbackOutcome[]
+  outreachExports         OutreachExport[]
+  leadAttributions        LeadAttribution[]
 
   @@index([status, createdAt])
   @@index([createdAt])
@@ -219,6 +321,9 @@ model CampaignContact {
   audioAssets      AudioAsset[]
   drops            Drop[]
   callbackOutcomes CallbackOutcome[]
+  outreachSequence OutreachSequence?
+  exportItems      OutreachExportItem[]
+  leadAttribution  LeadAttribution?
 
   @@unique([campaignId, contactId, propertyId])
   @@index([campaignId, status])
@@ -264,10 +369,10 @@ model VoiceConfiguration {
 }
 
 model AudioAsset {
-  id                      String                @id @default(uuid()) @db.Uuid
-  campaignContactId       String                @db.Uuid
-  scriptTemplateVersionId String                @db.Uuid
-  voiceConfigurationId    String                @db.Uuid
+  id                      String                  @id @default(uuid()) @db.Uuid
+  campaignContactId       String                  @db.Uuid
+  scriptTemplateVersionId String                  @db.Uuid
+  voiceConfigurationId    String                  @db.Uuid
   renderedText            String
   textHash                String
   voiceId                 String
@@ -275,45 +380,70 @@ model AudioAsset {
   characterCount          Int
   providerGenerationId    String?
   objectKey               String?
-  contentType             String                @default("audio/mpeg")
+  contentType             String                  @default("audio/mpeg")
   durationSeconds         Float?
-  estimatedCostCents      Int                   @default(0)
-  status                  AudioStatus           @default(PENDING)
+  estimatedCostCents      Int                     @default(0)
+  billingDisposition      AudioBillingDisposition @default(BILLABLE_GENERATION)
+  reuseCount              Int                     @default(0)
+  status                  AudioStatus             @default(PENDING)
   generatedAt             DateTime?
   errorMessage            String?
-  createdAt               DateTime              @default(now())
-  updatedAt               DateTime              @updatedAt
-  campaignContact         CampaignContact       @relation(fields: [campaignContactId], references: [id], onDelete: Cascade)
-  scriptTemplateVersion   ScriptTemplateVersion @relation(fields: [scriptTemplateVersionId], references: [id])
-  voiceConfiguration      VoiceConfiguration    @relation(fields: [voiceConfigurationId], references: [id])
+  createdAt               DateTime                @default(now())
+  updatedAt               DateTime                @updatedAt
+  campaignContact         CampaignContact         @relation(fields: [campaignContactId], references: [id], onDelete: Cascade)
+  scriptTemplateVersion   ScriptTemplateVersion   @relation(fields: [scriptTemplateVersionId], references: [id])
+  voiceConfiguration      VoiceConfiguration      @relation(fields: [voiceConfigurationId], references: [id])
   drops                   Drop[]
+  generationUsages        AudioGenerationUsage[]
 
   @@unique([campaignContactId, textHash, voiceId, modelId])
   @@index([campaignContactId, status])
   @@index([textHash])
 }
 
+model AudioGenerationUsage {
+  id                   String                  @id @default(uuid()) @db.Uuid
+  audioAssetId         String                  @db.Uuid
+  provider             String
+  providerGenerationId String?
+  characterCount       Int
+  estimatedCostCents   Int                     @default(0)
+  billingDisposition   AudioBillingDisposition
+  generatedAt          DateTime
+  storedAt             DateTime?
+  storageError         String?
+  createdAt            DateTime                @default(now())
+  audioAsset           AudioAsset              @relation(fields: [audioAssetId], references: [id], onDelete: Cascade)
+
+  @@index([audioAssetId, generatedAt])
+  @@index([billingDisposition, generatedAt])
+}
+
 model Drop {
-  id                 String          @id @default(uuid()) @db.Uuid
-  campaignContactId  String          @db.Uuid
-  audioAssetId       String          @db.Uuid
-  provider           String          @default("dropcowboy")
-  providerMessageId  String?         @unique
-  status             DropStatus      @default(PENDING)
-  providerResponse   Json?
-  estimatedCostCents Int             @default(0)
-  queuedAt           DateTime?
-  sentAt             DateTime?
-  deliveredAt        DateTime?
-  failedAt           DateTime?
-  optedOutAt         DateTime?
-  errorCode          String?
-  errorMessage       String?
-  createdAt          DateTime        @default(now())
-  updatedAt          DateTime        @updatedAt
-  campaignContact    CampaignContact @relation(fields: [campaignContactId], references: [id], onDelete: Cascade)
-  audioAsset         AudioAsset      @relation(fields: [audioAssetId], references: [id])
-  deliveryEvents     DeliveryEvent[]
+  id                      String           @id @default(uuid()) @db.Uuid
+  campaignContactId       String           @db.Uuid
+  audioAssetId            String           @db.Uuid
+  provider                String           @default("dropcowboy")
+  providerMessageId       String?          @unique
+  status                  DropStatus       @default(PENDING)
+  providerResponse        Json?
+  estimatedCostCents      Int              @default(0)
+  providerUsageValueCents Int              @default(0)
+  carrierDurationSeconds  Float?
+  carrierDurationSource   String?
+  queuedAt                DateTime?
+  sentAt                  DateTime?
+  deliveredAt             DateTime?
+  failedAt                DateTime?
+  optedOutAt              DateTime?
+  errorCode               String?
+  errorMessage            String?
+  createdAt               DateTime         @default(now())
+  updatedAt               DateTime         @updatedAt
+  campaignContact         CampaignContact  @relation(fields: [campaignContactId], references: [id], onDelete: Cascade)
+  audioAsset              AudioAsset       @relation(fields: [audioAssetId], references: [id])
+  deliveryEvents          DeliveryEvent[]
+  usageLedger             RvmUsageLedger[]
 
   @@unique([campaignContactId, provider])
   @@index([status, createdAt])
@@ -341,6 +471,7 @@ model CallbackOutcome {
   campaignContactId   String?             @db.Uuid
   normalizedPhone     String
   outcome             CallbackOutcomeType
+  attributionChannel  AttributionChannel  @default(RVM_CALLBACK)
   stonegateLeadId     String?
   summary             String?
   callbackAt          DateTime
@@ -353,6 +484,212 @@ model CallbackOutcome {
 
   @@index([normalizedPhone, callbackAt])
   @@index([campaignId, outcome])
+}
+
+model OutreachSequence {
+  id                  String                     @id @default(uuid()) @db.Uuid
+  campaignContactId   String                     @unique @db.Uuid
+  currentState        OutreachSequenceState      @default(RVM_PENDING)
+  version             Int                        @default(1)
+  rvmScheduledFor     DateTime?
+  rvmAttemptedAt      DateTime?
+  rvmSuccessfulAt     DateTime?
+  smsEligibleAt       DateTime?
+  smsExportedAt       DateTime?
+  smsSentAt           DateTime?
+  smsRespondedAt      DateTime?
+  coldCallEligibleAt  DateTime?
+  coldCallExportedAt  DateTime?
+  nextEligibleAt      DateTime?
+  terminalAt          DateTime?
+  terminalReason      String?
+  lastEventAt         DateTime                   @default(now())
+  createdAt           DateTime                   @default(now())
+  updatedAt           DateTime                   @updatedAt
+  campaignContact     CampaignContact            @relation(fields: [campaignContactId], references: [id], onDelete: Cascade)
+  events              OutreachEvent[]
+  exportItems         OutreachExportItem[]
+  exportClaims        OutreachExportClaim[]
+  externalOutcomeRows ExternalOutcomeImportRow[]
+
+  @@index([currentState, nextEligibleAt])
+  @@index([smsEligibleAt])
+  @@index([coldCallEligibleAt])
+  @@index([rvmScheduledFor])
+}
+
+model OutreachEvent {
+  id               String                @id @default(uuid()) @db.Uuid
+  sequenceId       String                @db.Uuid
+  type             OutreachEventType
+  channel          OutreachChannel
+  resultingState   OutreachSequenceState
+  outcome          String?
+  source           String
+  externalId       String?
+  idempotencyKey   String                @unique
+  actorUserId      String?               @db.Uuid
+  rawPayload       Json?
+  metadata         Json?
+  occurredAt       DateTime
+  recordedAt       DateTime              @default(now())
+  sequence         OutreachSequence      @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  actor            User?                 @relation("OutreachEventActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  leadAttributions LeadAttribution[]
+
+  @@index([sequenceId, occurredAt])
+  @@index([type, occurredAt])
+  @@index([channel, outcome, occurredAt])
+}
+
+model LeadAttribution {
+  id                String             @id @default(uuid()) @db.Uuid
+  campaignContactId String             @unique @db.Uuid
+  campaignId        String             @db.Uuid
+  creditedChannel   AttributionChannel
+  creditedEventId   String?            @db.Uuid
+  qualifyingOutcome String
+  attributedAt      DateTime
+  createdAt         DateTime           @default(now())
+  campaignContact   CampaignContact    @relation(fields: [campaignContactId], references: [id], onDelete: Cascade)
+  campaign          Campaign           @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  creditedEvent     OutreachEvent?     @relation(fields: [creditedEventId], references: [id], onDelete: SetNull)
+
+  @@index([campaignId, creditedChannel])
+  @@index([creditedChannel, attributedAt])
+}
+
+model OutreachExport {
+  id                String                @id @default(uuid()) @db.Uuid
+  idempotencyKey    String                @unique
+  type              OutreachExportType
+  campaignId        String?               @db.Uuid
+  createdByUserId   String                @db.Uuid
+  filename          String
+  itemCount         Int                   @default(0)
+  intentionalRepeat Boolean               @default(false)
+  repeatReason      String?
+  filtersSnapshot   Json?
+  createdAt         DateTime              @default(now())
+  campaign          Campaign?             @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  createdBy         User                  @relation("OutreachExportCreator", fields: [createdByUserId], references: [id])
+  items             OutreachExportItem[]
+  claims            OutreachExportClaim[]
+
+  @@index([type, createdAt])
+  @@index([campaignId, createdAt])
+}
+
+model OutreachExportItem {
+  id                String           @id @default(uuid()) @db.Uuid
+  exportId          String           @db.Uuid
+  sequenceId        String           @db.Uuid
+  campaignContactId String           @db.Uuid
+  occurrence        Int              @default(1)
+  rowSnapshot       Json
+  createdAt         DateTime         @default(now())
+  export            OutreachExport   @relation(fields: [exportId], references: [id], onDelete: Cascade)
+  sequence          OutreachSequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  campaignContact   CampaignContact  @relation(fields: [campaignContactId], references: [id], onDelete: Cascade)
+
+  @@unique([exportId, sequenceId])
+  @@index([sequenceId, createdAt])
+  @@index([campaignContactId])
+}
+
+model OutreachExportClaim {
+  id            String             @id @default(uuid()) @db.Uuid
+  sequenceId    String             @db.Uuid
+  type          OutreachExportType
+  firstExportId String             @db.Uuid
+  claimedAt     DateTime           @default(now())
+  sequence      OutreachSequence   @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  firstExport   OutreachExport     @relation(fields: [firstExportId], references: [id], onDelete: Cascade)
+
+  @@unique([sequenceId, type])
+  @@index([firstExportId])
+}
+
+model ExternalOutcomeImport {
+  id              String                      @id @default(uuid()) @db.Uuid
+  channel         ExternalOutcomeChannel
+  fileName        String
+  status          ExternalOutcomeImportStatus @default(PROCESSING)
+  createdByUserId String                      @db.Uuid
+  totalCount      Int                         @default(0)
+  acceptedCount   Int                         @default(0)
+  rejectedCount   Int                         @default(0)
+  createdAt       DateTime                    @default(now())
+  completedAt     DateTime?
+  createdBy       User                        @relation("ExternalOutcomeImportCreator", fields: [createdByUserId], references: [id])
+  rows            ExternalOutcomeImportRow[]
+
+  @@index([channel, createdAt])
+}
+
+model ExternalOutcomeImportRow {
+  id           String                   @id @default(uuid()) @db.Uuid
+  importId     String                   @db.Uuid
+  sequenceId   String?                  @db.Uuid
+  rowNumber    Int
+  status       ExternalOutcomeRowStatus
+  result       String?
+  externalId   String?
+  occurredAt   DateTime?
+  errorMessage String?
+  rawData      Json
+  createdAt    DateTime                 @default(now())
+  import       ExternalOutcomeImport    @relation(fields: [importId], references: [id], onDelete: Cascade)
+  sequence     OutreachSequence?        @relation(fields: [sequenceId], references: [id], onDelete: SetNull)
+
+  @@unique([importId, rowNumber])
+  @@index([sequenceId])
+}
+
+model ProviderBillingPeriod {
+  id                   String   @id @default(uuid()) @db.Uuid
+  providerKey          String
+  startsAt             DateTime
+  endsAt               DateTime
+  timezone             String
+  pricingSnapshot      Json
+  actualInvoiceCents   Int?
+  actualCarrierSeconds Int?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@unique([providerKey, startsAt, endsAt])
+  @@index([startsAt, endsAt])
+}
+
+model RvmDailyUsage {
+  id              String           @id @default(uuid()) @db.Uuid
+  localDate       DateTime         @db.Date
+  timezone        String
+  cap             Int
+  attemptedCount  Int              @default(0)
+  successfulCount Int              @default(0)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  entries         RvmUsageLedger[]
+
+  @@unique([localDate, timezone])
+  @@index([timezone, localDate])
+}
+
+model RvmUsageLedger {
+  id           String        @id @default(uuid()) @db.Uuid
+  dailyUsageId String        @db.Uuid
+  dropId       String        @db.Uuid
+  kind         RvmUsageKind
+  occurredAt   DateTime
+  createdAt    DateTime      @default(now())
+  dailyUsage   RvmDailyUsage @relation(fields: [dailyUsageId], references: [id], onDelete: Cascade)
+  drop         Drop          @relation(fields: [dropId], references: [id], onDelete: Cascade)
+
+  @@unique([dropId, kind])
+  @@index([dailyUsageId, kind])
+  @@index([kind, occurredAt])
 }
 
 model SuppressionEntry {

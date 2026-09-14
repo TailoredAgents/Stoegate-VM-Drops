@@ -52,13 +52,19 @@ const envSchema = z
       .min(1)
       .max(100000)
       .default(10),
+    MAX_LIVE_DAILY_RVM_ATTEMPTS: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(1000000)
+      .default(10),
     WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(4),
     DEFAULT_CAMPAIGN_SEND_LIMIT: z.coerce
       .number()
       .int()
       .min(1)
       .max(100000)
-      .default(1000),
+      .default(2000),
     PREVIEW_SAMPLE_SIZE: z.coerce.number().int().min(1).max(25).default(10),
     LOG_LEVEL: z.string().default("info"),
   })
