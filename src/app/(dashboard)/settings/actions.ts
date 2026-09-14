@@ -3,6 +3,7 @@
 import { Prisma } from "@prisma/client";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
+
 import { requireUser } from "@/lib/auth";
 import { db } from "@/lib/db";
 import {
@@ -14,41 +15,43 @@ import {
   type TextSettingKey,
 } from "@/lib/settings";
 
-const legacyKeys = new Set<NumericSettingKey>([
-  "rvm_cost_per_delivered_drop_cents",
-  "compliance_cost_per_message_cents",
+const integerKeys = new Set<NumericSettingKey>([
+  "sms_provider_fixed_monthly_fee_cents",
+  "sms_cost_per_outbound_message_micros",
+  "sms_cost_per_segment_micros",
+  "sms_cost_per_inbound_message_micros",
+  "sms_phone_number_monthly_cents",
+  "sms_registration_monthly_cents",
+  "sms_to_cold_call_delay_hours",
+  "daily_sms_cap",
+  "provider_billing_cycle_day",
+  "infrastructure_monthly_overhead_cents",
+]);
+
+const positiveKeys = new Set<NumericSettingKey>([
+  "sms_to_cold_call_delay_hours",
+  "daily_sms_cap",
+  "provider_billing_cycle_day",
+  "va_real_conversations_per_hour",
+  "va_real_conversations_per_lead",
+  "va_leads_per_deal",
 ]);
 
 export async function updateSettingsAction(formData: FormData) {
   const user = await requireUser();
   if (user.role !== "ADMIN") throw new Error("Admin access required");
+
   const values = new Map<string, string | number>();
   for (const key of Object.keys(NUMERIC_SETTINGS) as NumericSettingKey[]) {
-    if (legacyKeys.has(key)) continue;
-    let schema = z.coerce.number().nonnegative();
-    if (
-      [
-        "daily_rvm_cap",
-        "provider_billing_cycle_day",
-        "carrier_active_did_count",
-      ].includes(key)
-    )
-      schema = schema.int();
-    if (
-      [
-        "daily_rvm_cap",
-        "provider_billing_cycle_day",
-        "va_real_conversations_per_hour",
-        "va_real_conversations_per_lead",
-        "va_leads_per_deal",
-      ].includes(key)
-    )
-      schema = schema.positive();
+    let schema = z.coerce.number().finite().nonnegative();
+    if (integerKeys.has(key)) schema = schema.int();
+    if (positiveKeys.has(key)) schema = schema.positive();
     const value = schema.parse(formData.get(key));
     if (key === "provider_billing_cycle_day" && value > 28)
       throw new Error("Billing cycle day must be between 1 and 28");
     values.set(key, value);
   }
+
   const text = Object.fromEntries(
     (Object.keys(TEXT_SETTINGS) as TextSettingKey[]).map((key) => [
       key,
@@ -58,15 +61,16 @@ export async function updateSettingsAction(formData: FormData) {
   if (!isValidIanaTimezone(text.operations_timezone))
     throw new Error("Enter a valid IANA timezone such as America/New_York");
   if (
-    !isValidLocalTime(text.rvm_send_window_start) ||
-    !isValidLocalTime(text.rvm_send_window_end)
+    !isValidLocalTime(text.sms_send_window_start) ||
+    !isValidLocalTime(text.sms_send_window_end)
   )
-    throw new Error("Send-window values must use HH:MM");
-  if (Boolean(text.rvm_send_window_start) !== Boolean(text.rvm_send_window_end))
-    throw new Error("Set both send-window times or leave both blank");
-  if (!text.carrier_provider_name)
-    throw new Error("Carrier provider name is required");
+    throw new Error("SMS send-window values must use HH:MM");
+  if (Boolean(text.sms_send_window_start) !== Boolean(text.sms_send_window_end))
+    throw new Error("Set both SMS send-window times or leave both blank");
+  if (!text.sms_provider_display_name)
+    throw new Error("Provider display name is required");
   for (const [key, value] of Object.entries(text)) values.set(key, value);
+
   await db.$transaction(
     [...values].map(([key, value]) =>
       db.appSetting.upsert({
@@ -78,5 +82,6 @@ export async function updateSettingsAction(formData: FormData) {
   );
   revalidatePath("/settings");
   revalidatePath("/dashboard");
-  revalidatePath("/outreach");
+  revalidatePath("/operations");
+  revalidatePath("/campaigns/new");
 }

@@ -1,189 +1,78 @@
-import { randomUUID } from "node:crypto";
-import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { requireApiUser } from "@/lib/auth";
-import { db } from "@/lib/db";
-import { getEnv } from "@/lib/env";
-import type { CanonicalField } from "@/lib/import-fields";
+import {
+  commitSmsImport,
+  ImportCommitConflictError,
+  InactiveSmsTemplateVersionError,
+} from "@/lib/import-commit";
 import { assertSameOrigin } from "@/lib/request-security";
+import { isValidIanaTimezone } from "@/lib/settings";
+import { zonedDateTimeToUtc } from "@/lib/time";
 import { jsonError } from "@/lib/utils";
+
+const localDateTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
+const localTime = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 
 const bodySchema = z.object({
   batchId: z.uuid(),
   campaignName: z.string().trim().min(2).max(120),
-  scriptTemplateVersionId: z.uuid(),
-  voiceConfigurationId: z.uuid(),
-  sendLimit: z.number().int().min(1).max(100000).optional(),
+  sourceName: z.string().trim().max(200).optional(),
+  smsTemplateVersionId: z.uuid(),
+  sendLimit: z.number().int().min(1).max(100_000).optional(),
+  dailySendCap: z.number().int().min(1).max(100_000).optional(),
+  timezone: z.string().trim().min(1).max(100),
+  scheduledLocal: z.string().regex(localDateTime).optional(),
+  sendWindowStart: z.string().regex(localTime),
+  sendWindowEnd: z.string().regex(localTime),
+  coldCallDelayHours: z
+    .number()
+    .int()
+    .min(1)
+    .max(24 * 30)
+    .optional(),
+  complianceNotes: z.string().trim().max(2_000).optional(),
 });
 
-type Mapped = Record<CanonicalField, string>;
+function minutes(value: string) {
+  const [hour, minute] = value.split(":").map(Number);
+  return hour * 60 + minute;
+}
+
+function scheduledInstant(value: string | undefined, timezone: string) {
+  if (!value) return null;
+  const [date, time] = value.split("T");
+  const [year, month, day] = date.split("-").map(Number);
+  const [hour, minute] = time.split(":").map(Number);
+  return zonedDateTimeToUtc({ year, month, day, hour, minute }, timezone);
+}
 
 export async function POST(request: Request) {
   try {
-    await requireApiUser();
+    const user = await requireApiUser();
+    if (user.role !== "ADMIN") return jsonError("Admin access required", 403);
     assertSameOrigin(request);
     const input = bodySchema.parse(await request.json());
-    const batch = await db.importBatch.findUniqueOrThrow({
-      where: { id: input.batchId },
+    if (!isValidIanaTimezone(input.timezone))
+      return jsonError("Timezone must be a valid IANA timezone", 400);
+    if (input.sendWindowStart === input.sendWindowEnd)
+      return jsonError("SMS send-window start and end must differ", 400);
+    const result = await commitSmsImport({
+      ...input,
+      scheduledFor: scheduledInstant(input.scheduledLocal, input.timezone),
+      sendWindowStartMinutes: minutes(input.sendWindowStart),
+      sendWindowEndMinutes: minutes(input.sendWindowEnd),
+      createdByUserId: user.id,
     });
-    if (batch.status !== "ANALYZED" || batch.campaignId)
-      return jsonError("Import batch has already been committed", 409);
-    const sendLimit = input.sendLimit ?? getEnv().DEFAULT_CAMPAIGN_SEND_LIMIT;
-    const campaign = await db.campaign.create({
-      data: {
-        name: input.campaignName,
-        status: "DRAFT",
-        sendLimit,
-        uploadedCount: batch.uploadedCount,
-        eligibleCount: batch.eligibleCount,
-        invalidCount: batch.invalidCount,
-        duplicateCount: batch.duplicateCount,
-        suppressedCount: batch.suppressedCount,
-        scriptTemplateVersionId: input.scriptTemplateVersionId,
-        voiceConfigurationId: input.voiceConfigurationId,
-      },
-    });
-    let cursor: string | undefined;
-    do {
-      const rows = await db.importRow.findMany({
-        where: { importBatchId: batch.id, status: "ELIGIBLE" },
-        orderBy: { id: "asc" },
-        take: 500,
-        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      });
-      if (!rows.length) break;
-      cursor = rows.at(-1)!.id;
-      const phones = [
-        ...new Set(rows.map((row) => row.normalizedPhone!).filter(Boolean)),
-      ];
-      const firstByPhone = new Map<
-        string,
-        { mapped: Mapped; raw: Prisma.JsonValue }
-      >();
-      for (const row of rows)
-        if (!firstByPhone.has(row.normalizedPhone!))
-          firstByPhone.set(row.normalizedPhone!, {
-            mapped: row.mappedData as Mapped,
-            raw: row.rawData,
-          });
-      await db.contact.createMany({
-        data: [...firstByPhone.entries()].map(([phone, value]) => ({
-          normalizedPhone: phone,
-          firstName: value.mapped.first_name || null,
-          lastName: value.mapped.last_name || null,
-          ownerName: value.mapped.owner_name || null,
-          source: value.mapped.source || null,
-          externalId: value.mapped.external_id || null,
-          rawData: value.raw as Prisma.InputJsonValue,
-        })),
-        skipDuplicates: true,
-      });
-      const contacts = await db.contact.findMany({
-        where: { normalizedPhone: { in: phones } },
-        select: { id: true, normalizedPhone: true },
-      });
-      const contactByPhone = new Map(
-        contacts.map((contact) => [contact.normalizedPhone, contact.id]),
-      );
-      const prepared = rows.map((row) => {
-        const mapped = row.mappedData as Mapped;
-        const propertyId = randomUUID();
-        return {
-          row,
-          mapped,
-          propertyId,
-          contactId: contactByPhone.get(row.normalizedPhone!)!,
-        };
-      });
-      await db.$transaction([
-        db.property.createMany({
-          data: prepared.map(({ mapped, propertyId, row }) => ({
-            id: propertyId,
-            propertyAddress: mapped.property_address || null,
-            streetName: mapped.street_name || null,
-            city: mapped.city || null,
-            state: mapped.state || null,
-            postalCode: mapped.postal_code || null,
-            county: mapped.county || null,
-            acreage:
-              mapped.acreage && !Number.isNaN(Number(mapped.acreage))
-                ? new Prisma.Decimal(mapped.acreage)
-                : null,
-            propertyType: mapped.property_type || null,
-            externalId: mapped.external_id || null,
-            source: mapped.source || null,
-            rawData: row.rawData as Prisma.InputJsonValue,
-          })),
-        }),
-        db.contactProperty.createMany({
-          data: prepared.map(({ contactId, propertyId }) => ({
-            contactId,
-            propertyId,
-          })),
-          skipDuplicates: true,
-        }),
-        db.campaignContact.createMany({
-          data: prepared.map(({ row, contactId, propertyId }) => ({
-            campaignId: campaign.id,
-            contactId,
-            propertyId,
-            importRowId: row.id,
-          })),
-          skipDuplicates: true,
-        }),
-      ]);
-      const campaignContacts = await db.campaignContact.findMany({
-        where: {
-          campaignId: campaign.id,
-          importRowId: { in: prepared.map(({ row }) => row.id) },
-        },
-        select: { id: true },
-      });
-      await db.outreachSequence.createMany({
-        data: campaignContacts.map(({ id }) => ({ campaignContactId: id })),
-        skipDuplicates: true,
-      });
-      const sequences = await db.outreachSequence.findMany({
-        where: {
-          campaignContactId: {
-            in: campaignContacts.map(({ id }) => id),
-          },
-        },
-        select: { id: true, campaignContactId: true, createdAt: true },
-      });
-      await db.outreachEvent.createMany({
-        data: sequences.map((sequence) => ({
-          sequenceId: sequence.id,
-          type: "RVM_PENDING",
-          channel: "RVM",
-          resultingState: "RVM_PENDING",
-          occurredAt: sequence.createdAt,
-          source: "campaign_import",
-          idempotencyKey: `sequence:${sequence.campaignContactId}:created`,
-        })),
-        skipDuplicates: true,
-      });
-    } while (cursor);
-    await db.$transaction([
-      db.importBatch.update({
-        where: { id: batch.id },
-        data: {
-          campaignId: campaign.id,
-          status: "COMMITTED",
-          committedAt: new Date(),
-        },
-      }),
-      db.campaign.update({
-        where: { id: campaign.id },
-        data: { status: "DATA_READY" },
-      }),
-    ]);
-    return Response.json({ campaignId: campaign.id });
+    return Response.json(result);
   } catch (error) {
     if (error instanceof Error && error.message === "UNAUTHORIZED")
       return jsonError("Unauthorized", 401);
+    if (error instanceof ImportCommitConflictError)
+      return jsonError(error.message, 409);
+    if (error instanceof InactiveSmsTemplateVersionError)
+      return jsonError(error.message, 400);
     return jsonError(
-      error instanceof Error ? error.message : "Could not commit campaign",
+      error instanceof Error ? error.message : "Could not commit SMS campaign",
     );
   }
 }

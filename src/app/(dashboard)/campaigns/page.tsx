@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { CampaignStatus, Prisma } from "@prisma/client";
 import { Plus } from "lucide-react";
 import { StatusBadge } from "@/components/status-badge";
 import { db } from "@/lib/db";
@@ -19,6 +20,7 @@ export default async function CampaignsPage({
       "PREVIEW_GENERATING",
       "PREVIEW_READY",
       "APPROVED",
+      "SCHEDULED",
       "QUEUED",
       "SENDING",
       "PAUSED",
@@ -27,7 +29,10 @@ export default async function CampaignsPage({
     ].includes(query.status)
       ? query.status
       : undefined;
-  const where = status ? { status: status as never } : {};
+  const where: Prisma.CampaignWhereInput = {
+    kind: "SMS",
+    ...(status ? { status: status as CampaignStatus } : {}),
+  };
   const [campaigns, total] = await Promise.all([
     db.campaign.findMany({
       where,

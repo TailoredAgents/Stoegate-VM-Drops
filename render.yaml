@@ -1,8 +1,13 @@
 databases:
+  # Resource identifiers stay unchanged so the existing Render deployment and
+  # database are not replaced during the SMS product rebrand.
   - name: stonegate-vm-drops-db
     region: virginia
     databaseName: stonegate_vm_drops
     user: stonegate_vm_drops
+    # The application uses Render's private network; do not expose Postgres to
+    # external source ranges by default.
+    ipAllowList: []
 
 services:
   - type: web
@@ -34,56 +39,27 @@ services:
         sync: false
       - key: ADMIN_PASSWORD_HASH
         sync: false
-      - key: STONEGATE_INTEGRATION_API_KEY
-        sync: false
-      - key: DROP_COWBOY_WEBHOOK_SECRET
-        sync: false
-      - key: ELEVENLABS_API_KEY
-        sync: false
-      - key: ELEVENLABS_VOICE_ID
-        sync: false
-      - key: ELEVENLABS_MODEL_ID
-        value: eleven_flash_v2_5
-      - key: ELEVENLABS_OUTPUT_FORMAT
-        value: mp3_44100_128
-      - key: R2_ENDPOINT
-        sync: false
-      - key: R2_ACCESS_KEY_ID
-        sync: false
-      - key: R2_SECRET_ACCESS_KEY
-        sync: false
-      - key: R2_BUCKET_NAME
-        sync: false
-      - key: R2_PRESIGNED_URL_TTL_SECONDS
-        value: "86400"
-      - key: DROP_COWBOY_API_ENDPOINT
-        value: https://api.dropcowboy.com/v1/rvm
-      - key: DROP_COWBOY_TEAM_ID
-        sync: false
-      - key: DROP_COWBOY_SECRET
-        sync: false
-      - key: DROP_COWBOY_BRAND_ID
-        sync: false
-      - key: DROP_COWBOY_FORWARDING_NUMBER
-        sync: false
-      - key: RVM_LIVE_SENDS_ENABLED
+      - key: SMS_LIVE_SENDS_ENABLED
         value: "false"
-      - key: AUDIO_GENERATION_LIVE_ENABLED
-        value: "false"
-      - key: MAX_LIVE_CAMPAIGN_SEND_LIMIT
-        value: "10"
-      - key: MAX_LIVE_DAILY_RVM_ATTEMPTS
-        value: "10"
-      - key: DEFAULT_CAMPAIGN_SEND_LIMIT
+      - key: SMS_PROVIDER
+        value: dry-run
+      - key: DEFAULT_DAILY_SMS_LIMIT
         value: "2000"
-      - key: PREVIEW_SAMPLE_SIZE
+      - key: MAX_LIVE_SMS_CAMPAIGN_LIMIT
         value: "10"
+      - key: MAX_LIVE_DAILY_SMS_LIMIT
+        value: "10"
+      - key: DEFAULT_SMS_TO_COLD_CALL_DELAY_HOURS
+        value: "48"
 
   - type: worker
     name: stonegate-vm-drops-worker
     runtime: node
     region: virginia
     buildCommand: npm ci --include=dev && npm run db:generate
+    # Each service gates its own rollout on the same idempotent migration chain,
+    # so an independently deployed worker cannot start against the old schema.
+    preDeployCommand: npm run db:deploy
     startCommand: npm run worker
     maxShutdownDelaySeconds: 60
     envVars:
@@ -99,49 +75,17 @@ services:
         sync: false
       - key: SESSION_SECRET
         sync: false
-      - key: STONEGATE_INTEGRATION_API_KEY
-        sync: false
-      - key: ELEVENLABS_API_KEY
-        sync: false
-      - key: ELEVENLABS_VOICE_ID
-        sync: false
-      - key: ELEVENLABS_MODEL_ID
-        value: eleven_flash_v2_5
-      - key: ELEVENLABS_OUTPUT_FORMAT
-        value: mp3_44100_128
-      - key: R2_ENDPOINT
-        sync: false
-      - key: R2_ACCESS_KEY_ID
-        sync: false
-      - key: R2_SECRET_ACCESS_KEY
-        sync: false
-      - key: R2_BUCKET_NAME
-        sync: false
-      - key: R2_PRESIGNED_URL_TTL_SECONDS
-        value: "86400"
-      - key: DROP_COWBOY_API_ENDPOINT
-        value: https://api.dropcowboy.com/v1/rvm
-      - key: DROP_COWBOY_TEAM_ID
-        sync: false
-      - key: DROP_COWBOY_SECRET
-        sync: false
-      - key: DROP_COWBOY_BRAND_ID
-        sync: false
-      - key: DROP_COWBOY_FORWARDING_NUMBER
-        sync: false
-      - key: DROP_COWBOY_WEBHOOK_SECRET
-        sync: false
-      - key: RVM_LIVE_SENDS_ENABLED
+      - key: SMS_LIVE_SENDS_ENABLED
         value: "false"
-      - key: AUDIO_GENERATION_LIVE_ENABLED
-        value: "false"
-      - key: MAX_LIVE_CAMPAIGN_SEND_LIMIT
+      - key: SMS_PROVIDER
+        value: dry-run
+      - key: DEFAULT_DAILY_SMS_LIMIT
+        value: "2000"
+      - key: MAX_LIVE_SMS_CAMPAIGN_LIMIT
         value: "10"
-      - key: MAX_LIVE_DAILY_RVM_ATTEMPTS
+      - key: MAX_LIVE_DAILY_SMS_LIMIT
         value: "10"
+      - key: DEFAULT_SMS_TO_COLD_CALL_DELAY_HOURS
+        value: "48"
       - key: WORKER_CONCURRENCY
         value: "4"
-      - key: DEFAULT_CAMPAIGN_SEND_LIMIT
-        value: "2000"
-      - key: PREVIEW_SAMPLE_SIZE
-        value: "10"

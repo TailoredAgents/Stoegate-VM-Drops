@@ -1,4 +1,4 @@
-import { Voicemail } from "lucide-react";
+import { MessageSquareText } from "lucide-react";
 import { getCurrentUser } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import { loginAction } from "./actions";
@@ -15,11 +15,13 @@ export default async function LoginPage({
       <div className="w-full max-w-sm">
         <div className="mb-7 flex items-center justify-center gap-3 text-white">
           <span className="grid h-11 w-11 place-items-center rounded-xl bg-emerald-500 text-[#0b1728]">
-            <Voicemail />
+            <MessageSquareText />
           </span>
           <div>
             <p className="text-xl font-bold">Stonegate</p>
-            <p className="text-xs tracking-[0.18em] text-slate-400">VM DROPS</p>
+            <p className="text-xs tracking-[0.18em] text-slate-400">
+              SMS OUTREACH
+            </p>
           </div>
         </div>
         <form

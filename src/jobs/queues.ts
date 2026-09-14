@@ -3,10 +3,9 @@ import { getEnv } from "@/lib/env";
 import { logger } from "@/lib/logger";
 
 export const QUEUES = {
-  prepareCampaign: "campaign-prepare",
-  generateAudio: "audio-generate",
-  sendDrop: "rvm-send",
-  reconcileOutreach: "outreach-reconcile",
+  prepareCampaign: "sms-campaign-prepare",
+  sendSms: "sms-send",
+  reconcileOutreach: "sms-outreach-reconcile",
 } as const;
 
 let boss: PgBoss | undefined;
@@ -15,7 +14,7 @@ let started: Promise<PgBoss> | undefined;
 export function getBoss(): PgBoss {
   boss ??= new PgBoss({
     connectionString: getEnv().DATABASE_URL,
-    application_name: "stonegate-vm-drops",
+    application_name: "stonegate-sms-outreach",
   });
   return boss;
 }
@@ -48,43 +47,33 @@ export function startBoss(): Promise<PgBoss> {
 export async function enqueuePrepareCampaign(
   campaignId: string,
   mode: "preview" | "bulk",
+  startAfter?: Date,
 ) {
   const instance = await startBoss();
   return instance.send(
     QUEUES.prepareCampaign,
     { campaignId, mode },
-    { singletonKey: `${campaignId}:${mode}` },
+    {
+      singletonKey: `${campaignId}:${mode}`,
+      ...(startAfter ? { startAfter } : {}),
+    },
   );
 }
 
-export async function enqueueGenerateAudio(
+export async function enqueueSendSms(
   campaignId: string,
-  campaignContactId: string,
-  preview: boolean,
-) {
-  const instance = await startBoss();
-  return instance.send(
-    QUEUES.generateAudio,
-    { campaignId, campaignContactId, preview },
-    { singletonKey: campaignContactId },
-  );
-}
-
-export async function enqueueSendDrop(
-  campaignId: string,
-  campaignContactId: string,
-  audioAssetId: string,
+  messageId: string,
   startAfter?: Date,
 ) {
   const instance = await startBoss();
   return instance.send(
-    QUEUES.sendDrop,
-    { campaignId, campaignContactId, audioAssetId },
+    QUEUES.sendSms,
+    { campaignId, messageId },
     {
       singletonKey: startAfter
-        ? `${campaignContactId}:${startAfter.toISOString()}`
-        : campaignContactId,
-      startAfter,
+        ? `${messageId}:${startAfter.toISOString()}`
+        : messageId,
+      ...(startAfter ? { startAfter } : {}),
     },
   );
 }

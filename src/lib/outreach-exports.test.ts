@@ -6,12 +6,12 @@ import {
 } from "./outreach-exports";
 
 const input = {
-  type: "SMS_ELIGIBILITY",
+  type: "BATCH_DIALER",
   campaignId: "d5f41924-1c3b-4ce2-a85b-b8d1873ea30e",
-  stage: "SMS_ELIGIBLE",
   date: "2026-09-14",
   source: "  County list  ",
-  creditedChannel: "RVM_CALLBACK",
+  state: " ga ",
+  county: " Fulton ",
   idempotencyKey: "f2bb34aa-0775-48b9-8f87-2926f16217b5",
   user: {
     id: "8e48d110-f40d-4efb-8933-10273b58ca63",
@@ -23,10 +23,10 @@ describe("outreach export request identity", () => {
   it("captures every queue filter in a normalized snapshot", () => {
     expect(exportFilterSnapshot(input)).toEqual({
       campaignId: input.campaignId,
-      stage: "SMS_ELIGIBLE",
       date: "2026-09-14",
       source: "County list",
-      creditedChannel: "RVM_CALLBACK",
+      state: "GA",
+      county: "Fulton",
     });
   });
 
@@ -44,7 +44,7 @@ describe("outreach export request identity", () => {
     expect(
       exportRequestMatchesExisting(existing, {
         ...input,
-        stage: "SMS_EXPORTED",
+        county: "Cobb",
       }),
     ).toBe(false);
     expect(

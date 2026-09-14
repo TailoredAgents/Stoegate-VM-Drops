@@ -1,62 +1,53 @@
 "use client";
 
+import { Download, Loader2, Upload } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { Download, Loader2, MessageSquareText, Upload } from "lucide-react";
+
 import type { OutreachExportPreview } from "@/lib/outreach-exports";
 
-export interface OutreachExportScope {
+export interface BatchDialerExportScope {
   campaignId?: string;
   campaignName?: string;
-  stage?: string;
   date?: string;
   source?: string;
-  creditedChannel?: string;
+  state?: string;
+  county?: string;
 }
 
-export function OutreachExportControls({
+export function BatchDialerExportControls({
   scope,
-  previews,
+  preview,
 }: {
-  scope: OutreachExportScope;
-  previews: {
-    sms: OutreachExportPreview;
-    batchDialer: OutreachExportPreview;
-  };
+  scope: BatchDialerExportScope;
+  preview: OutreachExportPreview;
 }) {
   const router = useRouter();
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [repeat, setRepeat] = useState(false);
   const [repeatReason, setRepeatReason] = useState("");
   const [confirmation, setConfirmation] = useState("");
-
-  const previewFor = (type: "SMS_ELIGIBILITY" | "BATCH_DIALER") =>
-    type === "SMS_ELIGIBILITY" ? previews.sms : previews.batchDialer;
-  const countFor = (type: "SMS_ELIGIBILITY" | "BATCH_DIALER") => {
-    const preview = previewFor(type);
-    return repeat ? preview.includingRepeatCount : preview.newCount;
-  };
-  const exceedsLimit = (type: "SMS_ELIGIBILITY" | "BATCH_DIALER") => {
-    const preview = previewFor(type);
-    return repeat ? preview.repeatExceedsLimit : preview.newExceedsLimit;
-  };
+  const count = repeat ? preview.includingRepeatCount : preview.newCount;
+  const exceedsLimit = repeat
+    ? preview.repeatExceedsLimit
+    : preview.newExceedsLimit;
   const repeatReady =
     !repeat || (repeatReason.trim().length > 0 && confirmation === "RE-EXPORT");
 
-  async function create(type: "SMS_ELIGIBILITY" | "BATCH_DIALER") {
-    setBusy(type);
+  async function createExport() {
+    setBusy(true);
     setError("");
     const response = await fetch("/api/outreach/exports", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        type,
+        type: "BATCH_DIALER",
         campaignId: scope.campaignId,
-        stage: scope.stage,
         date: scope.date,
         source: scope.source,
-        creditedChannel: scope.creditedChannel,
+        state: scope.state,
+        county: scope.county,
         idempotencyKey: crypto.randomUUID(),
         intentionalRepeat: repeat,
         repeatReason: repeat ? repeatReason : undefined,
@@ -69,56 +60,33 @@ export function OutreachExportControls({
       router.refresh();
       window.location.assign(result.downloadUrl);
     }
-    setBusy(null);
+    setBusy(false);
   }
 
   return (
     <section className="card p-5">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h2 className="font-bold">Create external handoff</h2>
+          <h2 className="font-bold">BatchDialer handoff</h2>
           <p className="mt-1 max-w-2xl text-sm text-slate-500">
-            SMS exports only record eligibility. BatchDialer exports include
-            only RVM-successful contacts with a recorded SMS send and no
-            response.
+            Export only contacts with a confirmed SMS send, an elapsed response
+            window, no reply, no suppression, no known wrong number or lead, and
+            no prior BatchDialer claim.
           </p>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <button
-            className="btn-secondary"
-            disabled={
-              busy !== null ||
-              !repeatReady ||
-              countFor("SMS_ELIGIBILITY") === 0 ||
-              exceedsLimit("SMS_ELIGIBILITY")
-            }
-            onClick={() => void create("SMS_ELIGIBILITY")}
-          >
-            {busy === "SMS_ELIGIBILITY" ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <MessageSquareText className="h-4 w-4" />
-            )}
-            SMS CSV ({countFor("SMS_ELIGIBILITY").toLocaleString()})
-          </button>
-          <button
-            className="btn-primary"
-            disabled={
-              busy !== null ||
-              !repeatReady ||
-              countFor("BATCH_DIALER") === 0 ||
-              exceedsLimit("BATCH_DIALER")
-            }
-            onClick={() => void create("BATCH_DIALER")}
-          >
-            {busy === "BATCH_DIALER" ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Download className="h-4 w-4" />
-            )}
-            BatchDialer CSV ({countFor("BATCH_DIALER").toLocaleString()})
-          </button>
-        </div>
+        <button
+          className="btn-primary"
+          type="button"
+          disabled={busy || !repeatReady || count === 0 || exceedsLimit}
+          onClick={() => void createExport()}
+        >
+          {busy ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Download className="h-4 w-4" />
+          )}
+          BatchDialer CSV ({count.toLocaleString()})
+        </button>
       </div>
 
       <div className="mt-4 grid gap-2 rounded-lg bg-slate-50 p-3 text-xs text-slate-600 sm:grid-cols-2 lg:grid-cols-5">
@@ -126,28 +94,18 @@ export function OutreachExportControls({
           label="Campaign"
           value={scope.campaignName ?? "All campaigns"}
         />
-        <ScopeValue
-          label="Stage"
-          value={scope.stage?.replaceAll("_", " ") ?? "Export-required stage"}
-        />
-        <ScopeValue label="Event date" value={scope.date ?? "Any date"} />
+        <ScopeValue label="Eligible date" value={scope.date ?? "Any date"} />
         <ScopeValue label="Source" value={scope.source ?? "All sources"} />
-        <ScopeValue
-          label="Response channel"
-          value={
-            scope.creditedChannel?.replaceAll("_", " ") ?? "No channel filter"
-          }
-        />
+        <ScopeValue label="State" value={scope.state ?? "All states"} />
+        <ScopeValue label="County" value={scope.county ?? "All counties"} />
       </div>
-      {(previews.sms.newExceedsLimit ||
-        previews.sms.repeatExceedsLimit ||
-        previews.batchDialer.newExceedsLimit ||
-        previews.batchDialer.repeatExceedsLimit) && (
+
+      {exceedsLimit ? (
         <p className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
-          A matching cohort exceeds the {previews.sms.maxRows.toLocaleString()}-
-          row file limit. Narrow the filters before exporting.
+          This cohort exceeds the {preview.maxRows.toLocaleString()}-row file
+          limit. Narrow the filters before exporting.
         </p>
-      )}
+      ) : null}
 
       <details className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3">
         <summary className="cursor-pointer text-sm font-semibold text-amber-900">
@@ -159,7 +117,7 @@ export function OutreachExportControls({
             checked={repeat}
             onChange={(event) => setRepeat(event.target.checked)}
           />
-          Include already-exported contacts
+          Include contacts that already have a BatchDialer export claim
         </label>
         {repeat ? (
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -169,7 +127,7 @@ export function OutreachExportControls({
                 className="input"
                 value={repeatReason}
                 onChange={(event) => setRepeatReason(event.target.value)}
-                placeholder="Why is another handoff needed?"
+                placeholder="Why is another handoff required?"
               />
             </label>
             <label>
@@ -201,40 +159,6 @@ function ScopeValue({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function MarkSmsSentButton({ sequenceId }: { sequenceId: string }) {
-  const router = useRouter();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  async function mark() {
-    setBusy(true);
-    setError("");
-    const response = await fetch("/api/outreach/sms/mark-sent", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        sequenceIds: [sequenceId],
-        idempotencyKey: crypto.randomUUID(),
-      }),
-    });
-    const result = await response.json();
-    if (!response.ok) setError(result.error ?? "Could not mark sent");
-    else router.refresh();
-    setBusy(false);
-  }
-  return (
-    <div>
-      <button
-        className="text-xs font-semibold text-emerald-700"
-        disabled={busy}
-        onClick={() => void mark()}
-      >
-        {busy ? "Saving…" : "Mark SMS sent now"}
-      </button>
-      {error ? <p className="mt-1 text-[11px] text-rose-700">{error}</p> : null}
-    </div>
-  );
-}
-
 interface OutcomePreview {
   previewToken: string;
   confirmation: string;
@@ -245,9 +169,8 @@ interface OutcomePreview {
   errors: Array<{ rowNumber: number; error: string }>;
 }
 
-export function ExternalOutcomeImport() {
+export function ColdCallOutcomeImport() {
   const router = useRouter();
-  const [channel, setChannel] = useState<"SMS" | "COLD_CALL">("SMS");
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<OutcomePreview | null>(null);
   const [confirmation, setConfirmation] = useState("");
@@ -267,68 +190,63 @@ export function ExternalOutcomeImport() {
     setBusy(action);
     setError("");
     setMessage("");
-    const formData = new FormData();
-    formData.set("action", action);
-    formData.set("channel", channel);
-    formData.set("file", file);
-    if (action === "commit" && preview) {
-      formData.set("previewToken", preview.previewToken);
-      formData.set("confirmation", confirmation);
-    }
-    const response = await fetch("/api/outreach/outcome-imports", {
-      method: "POST",
-      body: formData,
-    });
-    const result = await response.json();
-    if (!response.ok) setError(result.error ?? "Outcome import failed");
-    else if (action === "preview") setPreview(result as OutcomePreview);
-    else {
-      setMessage(
-        `${result.accepted} accepted, ${result.duplicates} duplicates, ${result.rejected} rejected.`,
-      );
-      if (result.errors?.length)
-        setError(
-          result.errors
-            .slice(0, 10)
-            .map(
-              (item: { rowNumber: number; error: string }) =>
-                `Row ${item.rowNumber}: ${item.error}`,
-            )
-            .join("\n"),
+    try {
+      const formData = new FormData();
+      formData.set("action", action);
+      formData.set("channel", "COLD_CALL");
+      formData.set("file", file);
+      if (action === "commit" && preview) {
+        formData.set("previewToken", preview.previewToken);
+        formData.set("confirmation", confirmation);
+      }
+      const response = await fetch("/api/outreach/outcome-imports", {
+        method: "POST",
+        body: formData,
+      });
+      const result = await response.json();
+      if (!response.ok)
+        setError(result.error ?? "Cold-call outcome import failed");
+      else if (action === "preview") setPreview(result as OutcomePreview);
+      else {
+        setMessage(
+          `${result.accepted} accepted, ${result.duplicates} duplicates, ${result.rejected} rejected.`,
         );
-      setPreview(null);
-      setConfirmation("");
-      router.refresh();
+        if (result.errors?.length)
+          setError(
+            result.errors
+              .slice(0, 10)
+              .map(
+                (item: { rowNumber: number; error: string }) =>
+                  `Row ${item.rowNumber}: ${item.error}`,
+              )
+              .join("\n"),
+          );
+        setPreview(null);
+        setConfirmation("");
+        router.refresh();
+      }
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "Outcome import failed",
+      );
+    } finally {
+      setBusy(null);
     }
-    setBusy(null);
   }
 
   return (
     <section className="card p-5">
-      <h2 className="font-bold">Import external outcomes</h2>
+      <h2 className="font-bold">Import BatchDialer outcomes</h2>
       <p className="mt-1 text-sm leading-6 text-slate-500">
-        Preview first, then explicitly confirm the same file. Use Stonegate
-        Campaign Contact ID whenever possible. If IDs and phone are supplied,
-        they must all identify the same contact. SMS sent rows require an ISO-
-        8601 Sent At or Occurred At timestamp with a timezone.
+        Analyze a CSV first, then type the generated confirmation to commit the
+        same file. Use Stonegate Campaign Contact ID or Stonegate Export ID from
+        the handoff whenever possible; identifiers must agree.
       </p>
-      <div className="mt-4 grid gap-3 sm:grid-cols-[160px_1fr_auto]">
-        <select
-          className="input"
-          value={channel}
-          onChange={(event) => {
-            setChannel(event.target.value as "SMS" | "COLD_CALL");
-            resetPreview();
-          }}
-          aria-label="Outcome channel"
-        >
-          <option value="SMS">SMS</option>
-          <option value="COLD_CALL">Cold call</option>
-        </select>
+      <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_auto]">
         <input
           className="input pt-2"
           type="file"
-          accept=".csv"
+          accept=".csv,text/csv"
           onChange={(event) => {
             setFile(event.target.files?.[0] ?? null);
             resetPreview();

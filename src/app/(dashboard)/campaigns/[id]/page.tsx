@@ -2,18 +2,30 @@ import Link from "next/link";
 import {
   ArrowLeft,
   BadgeDollarSign,
-  PhoneCall,
+  MessageSquareReply,
+  Send,
   Target,
-  Voicemail,
 } from "lucide-react";
 import { notFound } from "next/navigation";
+
 import { CampaignActionPanel } from "@/components/campaign-action-panel";
 import { MetricCard } from "@/components/metric-card";
 import { StatusBadge } from "@/components/status-badge";
-import { getCampaignMetrics, getOutreachFunnel } from "@/lib/analytics";
 import { db } from "@/lib/db";
-import { getNumericSettings } from "@/lib/settings";
-import { formatCents } from "@/lib/utils";
+import { getEnv } from "@/lib/env";
+import { estimateSmsSegments } from "@/lib/sms";
+import { formatCents, percent } from "@/lib/utils";
+
+const PAGE_SIZE = 50;
+
+function numericJson(value: unknown, key: string, fallback = 0): number {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return fallback;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "number" && Number.isFinite(candidate)
+    ? Math.max(0, candidate)
+    : fallback;
+}
 
 export default async function CampaignDetailPage({
   params,
@@ -24,68 +36,130 @@ export default async function CampaignDetailPage({
 }) {
   const { id } = await params;
   const page = Math.max(1, Number((await searchParams).page) || 1);
-  const [campaign, metrics, settings, funnel] = await Promise.all([
-    db.campaign.findUnique({
-      where: { id },
+  const [
+    campaign,
+    totalContacts,
+    previews,
+    sent,
+    delivered,
+    failed,
+    replies,
+    qualified,
+    coldCallEligible,
+    coldCallExported,
+    actualCosts,
+    estimatedCosts,
+    env,
+  ] = await Promise.all([
+    db.campaign.findFirst({
+      where: { id, kind: "SMS" },
       include: {
-        scriptTemplateVersion: { include: { template: true } },
-        voiceConfiguration: true,
+        smsTemplateVersion: { include: { template: true } },
+        createdBy: { select: { email: true } },
+        approvedBy: { select: { email: true } },
+        launchedBy: { select: { email: true } },
         contacts: {
           orderBy: { createdAt: "asc" },
-          skip: (page - 1) * 50,
-          take: 50,
+          skip: (page - 1) * PAGE_SIZE,
+          take: PAGE_SIZE,
           include: {
             contact: true,
             property: true,
-            audioAssets: {
-              where: { status: "READY" },
-              orderBy: { createdAt: "desc" },
+            outboundMessages: {
+              orderBy: { sequenceNumber: "asc" },
               take: 1,
             },
-            drops: { take: 1 },
+            inboundMessages: {
+              orderBy: { receivedAt: "desc" },
+              take: 1,
+            },
             outreachSequence: true,
             leadAttribution: true,
           },
         },
       },
     }),
-    getCampaignMetrics(id),
-    getNumericSettings(),
-    getOutreachFunnel(id),
+    db.campaignContact.count({ where: { campaignId: id } }),
+    db.campaignContact.findMany({
+      where: { campaignId: id, isPreview: true },
+      include: { contact: true, property: true },
+      orderBy: { createdAt: "asc" },
+      take: 25,
+    }),
+    db.smsOutboundMessage.count({
+      where: { campaignContact: { campaignId: id }, sentAt: { not: null } },
+    }),
+    db.smsOutboundMessage.count({
+      where: {
+        campaignContact: { campaignId: id },
+        deliveredAt: { not: null },
+      },
+    }),
+    db.smsOutboundMessage.count({
+      where: {
+        campaignContact: { campaignId: id },
+        status: { in: ["FAILED", "UNDELIVERED"] },
+      },
+    }),
+    db.smsInboundMessage.count({
+      where: { campaignContact: { campaignId: id } },
+    }),
+    db.leadAttribution.count({ where: { campaignId: id } }),
+    db.outreachSequence.count({
+      where: {
+        campaignContact: { campaignId: id },
+        currentState: "COLD_CALL_ELIGIBLE",
+      },
+    }),
+    db.outreachSequence.count({
+      where: {
+        campaignContact: { campaignId: id },
+        currentState: "COLD_CALL_EXPORTED",
+      },
+    }),
+    db.smsOutboundMessage.aggregate({
+      where: {
+        campaignContact: { campaignId: id },
+        actualCostMicros: { not: null },
+      },
+      _sum: { actualCostMicros: true },
+    }),
+    db.smsOutboundMessage.aggregate({
+      where: {
+        campaignContact: { campaignId: id },
+        actualCostMicros: null,
+      },
+      _sum: { estimatedCostMicros: true },
+    }),
+    getEnv(),
   ]);
   if (!campaign) notFound();
-  const previews = await db.campaignContact.findMany({
-    where: { campaignId: id, isPreview: true },
-    include: {
-      contact: true,
-      property: true,
-      audioAssets: {
-        where: { status: "READY" },
-        orderBy: { createdAt: "desc" },
-        take: 1,
-      },
-    },
-    take: 25,
-  });
-  const averageCharacters = previews.length
-    ? Math.round(
-        previews.reduce(
-          (sum, row) => sum + (row.audioAssets[0]?.characterCount ?? 0),
-          0,
-        ) / previews.length,
-      )
-    : (campaign.scriptTemplateVersion?.body.length ?? 0);
-  const maxSends = Math.min(campaign.eligibleCount, campaign.sendLimit);
-  const estimatedCost = Math.round(
-    ((averageCharacters * maxSends) / 1000) *
-      settings.elevenlabs_cost_per_1000_chars_cents +
-      maxSends *
-        (settings.drop_cowboy_success_cost_cents +
-          (settings.carrier_average_seconds_per_attempt / 60) *
-            settings.carrier_voice_cents_per_minute),
+
+  const avgSegments = previews.length
+    ? previews.reduce(
+        (total, preview) =>
+          total + estimateSmsSegments(preview.renderedText ?? "").segmentCount,
+        0,
+      ) / previews.length
+    : estimateSmsSegments(campaign.smsTemplateVersion?.body ?? "").segmentCount;
+  const outboundMessageMicros = numericJson(
+    campaign.smsCostConfig,
+    "costPerOutboundMessageMicros",
   );
-  const optionalCents = (value: number | null) =>
-    value == null ? "—" : formatCents(value);
+  const segmentMicros = numericJson(
+    campaign.smsCostConfig,
+    "costPerSegmentMicros",
+    campaign.smsEstimatedCostPerSegmentMicros,
+  );
+  const plannedCount = Math.min(campaign.eligibleCount, campaign.sendLimit);
+  const plannedVariableCostCents =
+    (plannedCount * (outboundMessageMicros + avgSegments * segmentMicros)) /
+    10_000;
+  const recordedVariableCostCents =
+    ((actualCosts._sum.actualCostMicros ?? 0) +
+      (estimatedCosts._sum.estimatedCostMicros ?? 0)) /
+    10_000;
+
   return (
     <>
       <Link
@@ -104,170 +178,77 @@ export default async function CampaignDetailPage({
             <StatusBadge status={campaign.status} />
           </div>
           <p className="mt-2 text-sm text-slate-500">
-            {campaign.scriptTemplateVersion?.template.name ?? "No script"} ·{" "}
-            {campaign.voiceConfiguration?.name ?? "No voice"} · created{" "}
-            {campaign.createdAt.toLocaleDateString()}
+            {campaign.smsTemplateVersion
+              ? campaign.smsTemplateVersion.template.name +
+                " v" +
+                campaign.smsTemplateVersion.version
+              : "No SMS template"}
+            {" · "}
+            {campaign.sourceName || "No source label"}
+            {" · "}
+            {campaign.smsScheduleTimezone}
           </p>
         </div>
         <div className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-right">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-            Estimated marginal usage
+            Planned variable cost
           </p>
-          <p className="text-xl font-bold">{formatCents(estimatedCost)}</p>
+          <p className="text-xl font-bold">
+            {formatCents(plannedVariableCostCents)}
+          </p>
         </div>
       </div>
+
       <section className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard
-          label="Delivered"
-          value={metrics.delivered.toLocaleString()}
-          detail={`${metrics.deliveryRate.toFixed(1)}% delivery rate`}
-          icon={Voicemail}
+          label="Sent"
+          value={sent.toLocaleString()}
+          detail={`${delivered.toLocaleString()} delivered · ${percent(delivered, sent).toFixed(1)}%`}
+          icon={Send}
         />
         <MetricCard
-          label="Callbacks"
-          value={metrics.callbacks.toLocaleString()}
-          detail={`${metrics.callbackRate.toFixed(2)}% callback rate`}
-          icon={PhoneCall}
+          label="Replies"
+          value={replies.toLocaleString()}
+          detail={`${percent(replies, sent).toFixed(1)}% reply rate`}
+          icon={MessageSquareReply}
         />
         <MetricCard
           label="Qualified leads"
-          value={metrics.qualified.toLocaleString()}
-          detail={`${funnel.rvm.qualifiedLeads.toLocaleString()} RVM · ${funnel.sms.qualifiedLeads.toLocaleString()} SMS · ${funnel.coldCall.qualifiedLeads.toLocaleString()} cold-call`}
+          value={qualified.toLocaleString()}
+          detail={`${percent(qualified, sent).toFixed(2)}% of sent`}
           icon={Target}
         />
         <MetricCard
-          label="Campaign spend"
-          value={formatCents(metrics.totalCents)}
-          detail={
-            metrics.costPerQualifiedLeadCents == null
-              ? "Lead cost pending"
-              : `${formatCents(metrics.costPerQualifiedLeadCents)} / lead`
-          }
+          label="Recorded SMS cost"
+          value={formatCents(recordedVariableCostCents)}
+          detail={`${failed.toLocaleString()} failed or undelivered`}
           icon={BadgeDollarSign}
         />
       </section>
-      <section className="mt-6 grid gap-5 xl:grid-cols-[1.2fr_1fr]">
-        <div className="table-wrap overflow-x-auto">
-          <table className="data-table min-w-[650px]">
-            <thead>
-              <tr>
-                <th>Touch</th>
-                <th>Eligible / attempted</th>
-                <th>Sent / successful</th>
-                <th>Responses</th>
-                <th>Credited leads</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td className="font-semibold">RVM</td>
-                <td>{funnel.rvm.attempted.toLocaleString()}</td>
-                <td>{funnel.rvm.successful.toLocaleString()}</td>
-                <td>{funnel.rvm.callbacks.toLocaleString()} callbacks</td>
-                <td>{funnel.rvm.qualifiedLeads.toLocaleString()}</td>
-              </tr>
-              <tr>
-                <td className="font-semibold">External SMS</td>
-                <td>{funnel.sms.eligible.toLocaleString()}</td>
-                <td>{funnel.sms.sent.toLocaleString()}</td>
-                <td>{funnel.sms.replies.toLocaleString()} replies</td>
-                <td>{funnel.sms.qualifiedLeads.toLocaleString()}</td>
-              </tr>
-              <tr>
-                <td className="font-semibold">Human cold call</td>
-                <td>{funnel.coldCall.eligible.toLocaleString()}</td>
-                <td>{funnel.coldCall.exported.toLocaleString()} exported</td>
-                <td>{funnel.coldCall.contacted.toLocaleString()} contacted</td>
-                <td>{funnel.coldCall.qualifiedLeads.toLocaleString()}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <div className="card divide-y divide-slate-100 px-5">
-          {[
-            ["ElevenLabs generation", formatCents(metrics.ttsCents)],
-            [
-              "ElevenLabs characters",
-              metrics.elevenLabsCharacters.toLocaleString(),
-            ],
-            [
-              "Audio generations / reuses",
-              `${metrics.audioGenerated.toLocaleString()} / ${metrics.audioReuseCount.toLocaleString()}`,
-            ],
-            [
-              "Drop Cowboy marginal usage",
-              formatCents(metrics.marginalDropCowboyCents),
-            ],
-            [
-              "Allocated Drop Cowboy invoice",
-              formatCents(metrics.allocatedDropCowboyCents),
-            ],
-            ["Allocated carrier fixed", formatCents(metrics.carrierFixedCents)],
-            ["Carrier usage", formatCents(metrics.carrierVariableCents)],
-            ["Carrier total", formatCents(metrics.carrierTotalCents)],
-            [
-              "Infrastructure allocation",
-              formatCents(metrics.infrastructureCents),
-            ],
-            ["Total attributable", formatCents(metrics.totalCents)],
-            [
-              "Cost / attempted RVM",
-              optionalCents(metrics.costPerAttemptedCents),
-            ],
-            [
-              "Cost / successful RVM",
-              optionalCents(metrics.costPerDeliveredCents),
-            ],
-            ["Cost / callback", optionalCents(metrics.costPerCallbackCents)],
-            [
-              "Cost / interested seller",
-              optionalCents(metrics.costPerInterestedCents),
-            ],
-            [
-              "Cost / qualified lead",
-              optionalCents(metrics.costPerQualifiedLeadCents),
-            ],
-            ["Cost / contract", optionalCents(metrics.costPerContractCents)],
-            [
-              "Cost / closed deal",
-              optionalCents(metrics.actualCostPerClosedDealCents),
-            ],
-          ].map(([label, value]) => (
-            <div
-              className="flex items-center justify-between py-3"
-              key={String(label)}
-            >
-              <span className="text-sm text-slate-600">{label}</span>
-              <strong className="text-right text-sm">{value}</strong>
-            </div>
-          ))}
-          <p className="py-3 text-xs leading-5 text-slate-500">
-            Marginal usage is informational and is not added again to the
-            allocated monthly invoice cost.
-          </p>
-        </div>
-      </section>
+
       <section className="mt-6 grid gap-5 xl:grid-cols-[1fr_330px]">
         <div className="space-y-5">
           <div className="card p-5">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="font-bold">Import quality</h2>
+                <h2 className="font-bold">Import and handoff</h2>
                 <p className="mt-1 text-sm text-slate-500">
-                  Final classification before campaign creation.
+                  Cleaned list totals and the current BatchDialer queue.
                 </p>
               </div>
               <strong className="text-2xl">
                 {campaign.eligibleCount.toLocaleString()}
               </strong>
             </div>
-            <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-5">
+            <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
               {[
                 ["Uploaded", campaign.uploadedCount],
                 ["Eligible", campaign.eligibleCount],
                 ["Duplicates", campaign.duplicateCount],
                 ["Suppressed", campaign.suppressedCount],
                 ["Invalid", campaign.invalidCount],
+                ["Call eligible", coldCallEligible],
+                ["Exported", coldCallExported],
               ].map(([label, value]) => (
                 <div className="rounded-lg bg-slate-50 p-3" key={String(label)}>
                   <p className="text-xs text-slate-500">{label}</p>
@@ -278,12 +259,14 @@ export default async function CampaignDetailPage({
               ))}
             </div>
           </div>
+
           <div>
             <div className="mb-3 flex items-center justify-between">
               <div>
-                <h2 className="font-bold">Preview approvals</h2>
+                <h2 className="font-bold">Personalized preview</h2>
                 <p className="mt-1 text-sm text-slate-500">
-                  Random personalized messages selected from eligible contacts.
+                  Review the actual owner/property text and its SMS encoding
+                  before approval.
                 </p>
               </div>
               <span className="text-sm font-semibold text-slate-500">
@@ -292,19 +275,16 @@ export default async function CampaignDetailPage({
             </div>
             <div className="grid gap-3 lg:grid-cols-2">
               {previews.map((preview) => {
-                const audio = preview.audioAssets[0];
+                const analysis = estimateSmsSegments(
+                  preview.renderedText ?? "",
+                );
                 return (
                   <article className="card p-4" key={preview.id}>
                     <div className="flex items-start justify-between gap-3">
                       <div>
                         <p className="font-semibold">
                           {preview.contact.ownerName ||
-                            [
-                              preview.contact.firstName,
-                              preview.contact.lastName,
-                            ]
-                              .filter(Boolean)
-                              .join(" ") ||
+                            preview.contact.firstName ||
                             "Unnamed owner"}
                         </p>
                         <p className="mt-0.5 text-xs text-slate-500">
@@ -312,105 +292,125 @@ export default async function CampaignDetailPage({
                             "No property address"}
                         </p>
                       </div>
-                      <StatusBadge status={audio?.status ?? "PENDING"} />
+                      <span className="whitespace-nowrap text-xs text-slate-500">
+                        {analysis.encoding} · {analysis.segmentCount} segment
+                        {analysis.segmentCount === 1 ? "" : "s"}
+                      </span>
                     </div>
-                    <p className="mt-3 line-clamp-3 text-sm leading-6 text-slate-600">
-                      {audio?.renderedText ||
-                        preview.renderedText ||
-                        "Audio generation queued."}
+                    <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-slate-700">
+                      {preview.renderedText || "Preview has not been rendered."}
                     </p>
-                    {audio ? (
-                      <audio
-                        className="mt-3 h-9 w-full"
-                        controls
-                        preload="none"
-                        src={`/api/audio/${audio.id}`}
-                      />
-                    ) : null}
                   </article>
                 );
               })}
               {!previews.length ? (
                 <div className="card col-span-full p-8 text-center text-sm text-slate-500">
-                  Generate a preview sample to review rendered scripts and audio
-                  before approval.
+                  Render a preview sample to review personalized messages before
+                  approval.
                 </div>
               ) : null}
             </div>
           </div>
         </div>
+
         <CampaignActionPanel
           id={campaign.id}
           name={campaign.name}
           status={campaign.status}
           eligible={campaign.eligibleCount}
           sendLimit={campaign.sendLimit}
-          estimatedCost={formatCents(estimatedCost)}
+          dailyCap={campaign.smsDailyCap}
+          estimatedCost={formatCents(plannedVariableCostCents)}
+          liveSms={env.SMS_LIVE_SENDS_ENABLED}
         />
       </section>
+
       <section className="mt-7">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-lg font-bold">Recipients</h2>
-          <span className="text-xs text-slate-500">50 per page</span>
+          <span className="text-xs text-slate-500">
+            {totalContacts.toLocaleString()} total · {PAGE_SIZE} per page
+          </span>
         </div>
-        <div className="table-wrap">
-          <table className="data-table">
+        <div className="table-wrap overflow-x-auto">
+          <table className="data-table min-w-[850px]">
             <thead>
               <tr>
                 <th>Owner / phone</th>
                 <th>Property</th>
-                <th>Audio</th>
-                <th>Drop</th>
-                <th>Sequence</th>
+                <th>SMS</th>
+                <th>Latest reply</th>
+                <th>Sequence / attribution</th>
               </tr>
             </thead>
             <tbody>
-              {campaign.contacts.map((cc) => (
-                <tr key={cc.id}>
-                  <td>
-                    <p className="font-semibold text-slate-950">
-                      {cc.contact.ownerName ||
-                        cc.contact.firstName ||
-                        "Unnamed"}
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      {cc.contact.normalizedPhone}
-                    </p>
-                  </td>
-                  <td>
-                    <p>{cc.property?.propertyAddress || "—"}</p>
-                    <p className="text-xs text-slate-500">
-                      {[cc.property?.city, cc.property?.state]
-                        .filter(Boolean)
-                        .join(", ")}
-                    </p>
-                  </td>
-                  <td>
-                    <StatusBadge
-                      status={cc.audioAssets[0]?.status ?? "PENDING"}
-                    />
-                  </td>
-                  <td>
-                    <StatusBadge status={cc.drops[0]?.status ?? cc.status} />
-                  </td>
-                  <td>
-                    <StatusBadge
-                      status={
-                        cc.outreachSequence?.currentState ?? "NOT_ENROLLED"
-                      }
-                    />
-                    {cc.leadAttribution ? (
-                      <p className="mt-1 text-[11px] text-slate-500">
-                        Lead:{" "}
-                        {cc.leadAttribution.creditedChannel.replaceAll(
-                          "_",
-                          " ",
-                        )}
+              {campaign.contacts.map((cc) => {
+                const message = cc.outboundMessages[0];
+                const reply = cc.inboundMessages[0];
+                return (
+                  <tr key={cc.id}>
+                    <td>
+                      <p className="font-semibold text-slate-950">
+                        {cc.contact.ownerName ||
+                          cc.contact.firstName ||
+                          "Unnamed"}
                       </p>
-                    ) : null}
-                  </td>
-                </tr>
-              ))}
+                      <p className="text-xs text-slate-500">
+                        {cc.contact.normalizedPhone}
+                      </p>
+                    </td>
+                    <td>
+                      <p>{cc.property?.propertyAddress || "—"}</p>
+                      <p className="text-xs text-slate-500">
+                        {[
+                          cc.property?.city,
+                          cc.property?.state,
+                          cc.property?.county,
+                        ]
+                          .filter(Boolean)
+                          .join(", ")}
+                      </p>
+                    </td>
+                    <td>
+                      <StatusBadge status={message?.status ?? cc.status} />
+                      {message ? (
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          {message.segmentCount} segment
+                          {message.segmentCount === 1 ? "" : "s"}
+                        </p>
+                      ) : null}
+                    </td>
+                    <td>
+                      {reply ? (
+                        <>
+                          <StatusBadge status={reply.classification} />
+                          <p className="mt-1 max-w-56 truncate text-xs text-slate-500">
+                            {reply.body}
+                          </p>
+                        </>
+                      ) : (
+                        <span className="text-slate-400">No reply</span>
+                      )}
+                    </td>
+                    <td>
+                      <StatusBadge
+                        status={
+                          cc.outreachSequence?.currentState ?? "NOT_ENROLLED"
+                        }
+                      />
+                      {cc.leadAttribution ? (
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          Lead:{" "}
+                          {cc.leadAttribution.creditedChannel.replaceAll(
+                            "_",
+                            " ",
+                          )}
+                        </p>
+                      ) : null}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -423,7 +423,7 @@ export default async function CampaignDetailPage({
               Previous
             </Link>
           ) : null}
-          {campaign.contacts.length === 50 ? (
+          {page * PAGE_SIZE < totalContacts ? (
             <Link
               className="btn-secondary"
               href={`/campaigns/${id}?page=${page + 1}`}

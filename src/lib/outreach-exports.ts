@@ -1,10 +1,4 @@
-import {
-  type AttributionChannel,
-  type OutreachExportType,
-  type OutreachSequenceState,
-  Prisma,
-  type UserRole,
-} from "@prisma/client";
+import { Prisma, type UserRole } from "@prisma/client";
 import { createCsv } from "@/lib/csv";
 import { db } from "@/lib/db";
 import { normalizeUSPhone } from "@/lib/phone";
@@ -16,10 +10,27 @@ export const MAX_OUTREACH_EXPORT_ROWS = 25_000;
 const candidateInclude = Prisma.validator<Prisma.OutreachSequenceInclude>()({
   campaignContact: {
     include: {
-      campaign: { select: { id: true, name: true } },
+      campaign: {
+        select: { id: true, name: true, sourceName: true },
+      },
       contact: true,
       property: true,
       importRow: { select: { mappedData: true, rawData: true } },
+      outboundMessages: {
+        where: { sequenceNumber: 1 },
+        select: {
+          status: true,
+          sentAt: true,
+          deliveredAt: true,
+          templateVersion: {
+            select: {
+              version: true,
+              template: { select: { name: true } },
+            },
+          },
+        },
+        take: 1,
+      },
     },
   },
 });
@@ -28,43 +39,27 @@ type ExportCandidate = Prisma.OutreachSequenceGetPayload<{
   include: typeof candidateInclude;
 }>;
 
-export const SMS_EXPORT_HEADERS = [
-  "Stonegate Campaign Contact ID",
-  "Stonegate Contact ID",
-  "Phone",
-  "First Name",
-  "Last Name",
-  "Owner Name",
-  "Property Address",
-  "City",
-  "State",
-  "ZIP",
-  "Campaign",
-  "Source",
-  "RVM Sent Timestamp",
-  "SMS Eligible Timestamp",
-  "Stonegate Export ID",
-] as const;
-
 export const BATCH_DIALER_HEADERS = [
   "First Name",
   "Last Name",
   "Owner Name",
   "Phone",
   "Property Address",
+  "Street Name",
   "City",
   "State",
   "ZIP",
   "County",
+  "Acreage",
   "Property Type",
   "Source",
   "Campaign",
-  "RVM Sent Timestamp",
+  "SMS Status",
   "SMS Sent Timestamp",
+  "SMS Delivered Timestamp",
+  "SMS Template",
   "Stonegate Contact ID",
   "Stonegate Campaign Contact ID",
-  "Street Name",
-  "Acreage",
   "Source External ID",
   "Stonegate Export ID",
 ] as const;
@@ -84,14 +79,11 @@ function stringRecord(value: Prisma.JsonValue | null | undefined) {
   );
 }
 
-function candidateRow(
-  candidate: ExportCandidate,
-  exportId: string,
-  type: OutreachExportType,
-) {
+function candidateRow(candidate: ExportCandidate, exportId: string) {
   const cc = candidate.campaignContact;
   const mapped = stringRecord(cc.importRow?.mappedData);
   const raw = stringRecord(cc.importRow?.rawData);
+  const message = cc.outboundMessages[0];
   const base: Record<string, string> = {
     "First Name": mapped.first_name || cc.contact.firstName || "",
     "Last Name": mapped.last_name || cc.contact.lastName || "",
@@ -99,20 +91,33 @@ function candidateRow(
     Phone: cc.contact.normalizedPhone,
     "Property Address":
       mapped.property_address || cc.property?.propertyAddress || "",
+    "Street Name": mapped.street_name || cc.property?.streetName || "",
     City: mapped.city || cc.property?.city || "",
     State: mapped.state || cc.property?.state || "",
     ZIP: mapped.postal_code || cc.property?.postalCode || "",
     County: mapped.county || cc.property?.county || "",
+    Acreage: mapped.acreage || cc.property?.acreage?.toString() || "",
     "Property Type": mapped.property_type || cc.property?.propertyType || "",
-    Source: mapped.source || cc.property?.source || cc.contact.source || "",
+    Source:
+      mapped.source ||
+      cc.campaign.sourceName ||
+      cc.property?.source ||
+      cc.contact.source ||
+      "",
     Campaign: cc.campaign.name,
-    "RVM Sent Timestamp": candidate.rvmAttemptedAt?.toISOString() ?? "",
-    "SMS Sent Timestamp": candidate.smsSentAt?.toISOString() ?? "",
-    "SMS Eligible Timestamp": candidate.smsEligibleAt?.toISOString() ?? "",
+    "SMS Status": message?.status ?? "",
+    "SMS Sent Timestamp":
+      message?.sentAt?.toISOString() ??
+      candidate.smsSentAt?.toISOString() ??
+      "",
+    "SMS Delivered Timestamp": message?.deliveredAt?.toISOString() ?? "",
+    "SMS Template": message
+      ? message.templateVersion.template.name +
+        " v" +
+        message.templateVersion.version
+      : "",
     "Stonegate Contact ID": cc.contactId,
     "Stonegate Campaign Contact ID": cc.id,
-    "Street Name": mapped.street_name || cc.property?.streetName || "",
-    Acreage: mapped.acreage || cc.property?.acreage?.toString() || "",
     "Source External ID":
       mapped.external_id ||
       cc.property?.externalId ||
@@ -120,10 +125,8 @@ function candidateRow(
       "",
     "Stonegate Export ID": exportId,
   };
-  if (type === "BATCH_DIALER") {
-    for (const [header, value] of Object.entries(raw))
-      base[`Original - ${header}`] = value;
-  }
+  for (const [header, value] of Object.entries(raw))
+    base["Original - " + header] = value;
   return base;
 }
 
@@ -139,14 +142,14 @@ function slug(value: string) {
 
 export interface OutreachExportFilters {
   campaignId?: string;
-  stage?: OutreachSequenceState;
   date?: string;
   source?: string;
-  creditedChannel?: AttributionChannel;
+  state?: string;
+  county?: string;
 }
 
 export interface CreateOutreachExportInput extends OutreachExportFilters {
-  type: OutreachExportType;
+  type: "BATCH_DIALER";
   idempotencyKey: string;
   intentionalRepeat?: boolean;
   repeatReason?: string;
@@ -165,10 +168,10 @@ export interface OutreachExportPreview {
 export function exportFilterSnapshot(input: OutreachExportFilters) {
   return {
     campaignId: input.campaignId ?? null,
-    stage: input.stage ?? null,
     date: input.date ?? null,
     source: input.source?.trim() || null,
-    creditedChannel: input.creditedChannel ?? null,
+    state: input.state?.trim().toUpperCase() || null,
+    county: input.county?.trim() || null,
   };
 }
 
@@ -180,7 +183,7 @@ function jsonRecord(value: Prisma.JsonValue | null | undefined) {
 
 export function exportRequestMatchesExisting(
   existing: {
-    type: OutreachExportType;
+    type: string;
     campaignId: string | null;
     createdByUserId: string;
     intentionalRepeat: boolean;
@@ -190,35 +193,26 @@ export function exportRequestMatchesExisting(
   input: CreateOutreachExportInput,
 ) {
   const stored = jsonRecord(existing.filtersSnapshot);
-  const requestedFilters = exportFilterSnapshot(input);
-  const existingFilters = {
-    campaignId:
-      typeof stored.campaignId === "string" ? stored.campaignId : null,
-    stage: typeof stored.stage === "string" ? stored.stage : null,
-    date: typeof stored.date === "string" ? stored.date : null,
-    source: typeof stored.source === "string" ? stored.source : null,
-    creditedChannel:
-      typeof stored.creditedChannel === "string"
-        ? stored.creditedChannel
-        : null,
-  };
+  const requested = exportFilterSnapshot(input);
   return (
-    existing.type === input.type &&
-    existing.campaignId === requestedFilters.campaignId &&
+    existing.type === "BATCH_DIALER" &&
+    existing.campaignId === requested.campaignId &&
     existing.createdByUserId === input.user.id &&
     existing.intentionalRepeat === (input.intentionalRepeat === true) &&
     (existing.repeatReason ?? null) ===
       (input.intentionalRepeat ? input.repeatReason?.trim() || null : null) &&
-    existingFilters.campaignId === requestedFilters.campaignId &&
-    existingFilters.stage === requestedFilters.stage &&
-    existingFilters.date === requestedFilters.date &&
-    existingFilters.source === requestedFilters.source &&
-    existingFilters.creditedChannel === requestedFilters.creditedChannel
+    (stored.campaignId ?? null) === requested.campaignId &&
+    (stored.date ?? null) === requested.date &&
+    (stored.source ?? null) === requested.source &&
+    (stored.state ?? null) === requested.state &&
+    (stored.county ?? null) === requested.county
   );
 }
 
 async function dateRange(date: string | undefined) {
-  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return undefined;
+  if (!date) return undefined;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date))
+    throw new Error("Export date is invalid");
   const [year, month, day] = date.split("-").map(Number);
   if (
     !year ||
@@ -229,11 +223,10 @@ async function dateRange(date: string | undefined) {
   )
     throw new Error("Export date is invalid");
   const { operations_timezone: timeZone } = await getAppSettings();
-  const reference = zonedDateTimeToUtc(
-    { year, month, day, hour: 12, minute: 0 },
+  return getLocalDayBounds(
+    zonedDateTimeToUtc({ year, month, day, hour: 12, minute: 0 }, timeZone),
     timeZone,
   );
-  return getLocalDayBounds(reference, timeZone);
 }
 
 export function campaignSpecificSourceFilter(
@@ -242,6 +235,7 @@ export function campaignSpecificSourceFilter(
   const match = { contains: source, mode: "insensitive" as const };
   return {
     OR: [
+      { campaign: { is: { sourceName: match } } },
       {
         importRow: {
           is: {
@@ -253,83 +247,79 @@ export function campaignSpecificSourceFilter(
           },
         },
       },
-      {
-        AND: [
-          {
-            OR: [
-              { importRow: { is: null } },
-              {
-                importRow: {
-                  is: { mappedData: { path: ["source"], equals: "" } },
-                },
-              },
-            ],
-          },
-          { property: { is: { source: match } } },
-        ],
-      },
+      { property: { is: { source: match } } },
+      { contact: { is: { source: match } } },
     ],
   };
 }
 
 async function candidateWhere(
-  input: OutreachExportFilters & {
-    type: OutreachExportType;
-    intentionalRepeat: boolean;
-  },
+  input: OutreachExportFilters & { intentionalRepeat: boolean },
 ): Promise<Prisma.OutreachSequenceWhereInput> {
-  const expectedState =
-    input.type === "SMS_ELIGIBILITY" ? "SMS_ELIGIBLE" : "COLD_CALL_ELIGIBLE";
-  const exportedState =
-    input.type === "SMS_ELIGIBILITY" ? "SMS_EXPORTED" : "COLD_CALL_EXPORTED";
   const range = await dateRange(input.date);
-  const campaignContactFilters: Prisma.CampaignContactWhereInput[] = [
-    { leadAttribution: { is: null } },
-    {
-      contact: {
-        suppressions: { none: {} },
-        campaigns: { none: { leadAttribution: { isNot: null } } },
-      },
-    },
-  ];
-  if (input.campaignId)
-    campaignContactFilters.push({ campaignId: input.campaignId });
+  const campaignContactFilters: Prisma.CampaignContactWhereInput[] = [];
   if (input.source?.trim())
     campaignContactFilters.push(
       campaignSpecificSourceFilter(input.source.trim()),
     );
-  // Exportable contacts cannot already have lead attribution. Retaining the
-  // credited-channel condition makes a filtered response view correctly yield
-  // zero exportable rows instead of silently dropping that filter.
-  if (input.creditedChannel)
+  if (input.state?.trim())
     campaignContactFilters.push({
-      leadAttribution: { is: { creditedChannel: input.creditedChannel } },
-    });
-
-  return {
-    AND: [
-      {
-        currentState: input.intentionalRepeat
-          ? { in: [expectedState, exportedState] }
-          : expectedState,
+      property: {
+        is: {
+          state: {
+            equals: input.state.trim().toUpperCase(),
+            mode: "insensitive",
+          },
+        },
       },
-      ...(input.stage ? [{ currentState: input.stage }] : []),
-      ...(range ? [{ lastEventAt: { gte: range.start, lt: range.end } }] : []),
-    ],
+    });
+  if (input.county?.trim())
+    campaignContactFilters.push({
+      property: {
+        is: {
+          county: {
+            contains: input.county.trim(),
+            mode: "insensitive",
+          },
+        },
+      },
+    });
+  return {
+    currentState: input.intentionalRepeat
+      ? { in: ["COLD_CALL_ELIGIBLE", "COLD_CALL_EXPORTED"] }
+      : "COLD_CALL_ELIGIBLE",
     terminalAt: null,
-    rvmSuccessfulAt: { not: null },
-    ...(input.type === "BATCH_DIALER"
-      ? { smsSentAt: { not: null }, smsRespondedAt: null }
+    smsSentAt: { not: null },
+    smsRespondedAt: null,
+    ...(range
+      ? { coldCallEligibleAt: { gte: range.start, lt: range.end } }
       : {}),
     ...(input.intentionalRepeat
       ? {}
-      : { exportClaims: { none: { type: input.type } } }),
-    campaignContact: { AND: campaignContactFilters },
+      : { exportClaims: { none: { type: "BATCH_DIALER" } } }),
+    campaignContact: {
+      campaign: {
+        is: {
+          kind: "SMS",
+          ...(input.campaignId ? { id: input.campaignId } : {}),
+        },
+      },
+      leadAttribution: { is: null },
+      inboundMessages: { none: {} },
+      contact: {
+        is: {
+          suppressions: { none: {} },
+          campaigns: { none: { leadAttribution: { isNot: null } } },
+        },
+      },
+      outboundMessages: { some: { sentAt: { not: null } } },
+      ...(campaignContactFilters.length ? { AND: campaignContactFilters } : {}),
+    },
   };
 }
 
 export async function previewOutreachExport(
-  input: OutreachExportFilters & { type: OutreachExportType },
+  input: OutreachExportFilters & { type: "BATCH_DIALER" },
 ): Promise<OutreachExportPreview> {
   const [newCount, includingRepeatCount] = await Promise.all([
     candidateWhere({ ...input, intentionalRepeat: false }).then((where) =>
@@ -374,78 +364,78 @@ async function createOnce(input: CreateOutreachExportInput) {
       throw new Error("A repeat-export reason is required");
   }
   const where = await candidateWhere({ ...input, intentionalRepeat });
-  const exportedState =
-    input.type === "SMS_ELIGIBILITY" ? "SMS_EXPORTED" : "COLD_CALL_EXPORTED";
   return db.$transaction(
     async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`outreach-export:${input.idempotencyKey}`}))::text`;
-      const concurrentExisting = await tx.outreachExport.findUnique({
+      await tx.$queryRawUnsafe(
+        "SELECT pg_advisory_xact_lock(hashtext($1))::text",
+        "batch-export:" + input.idempotencyKey,
+      );
+      const concurrent = await tx.outreachExport.findUnique({
         where: { idempotencyKey: input.idempotencyKey },
       });
-      if (concurrentExisting)
-        return assertIdempotentMatch(concurrentExisting, input);
+      if (concurrent) return assertIdempotentMatch(concurrent, input);
 
-      let candidates = await tx.outreachSequence.findMany({
+      const candidates = await tx.outreachSequence.findMany({
         where,
         include: candidateInclude,
-        orderBy: { lastEventAt: "asc" },
+        orderBy: { coldCallEligibleAt: "asc" },
         take: MAX_OUTREACH_EXPORT_ROWS + 1,
       });
       if (candidates.length > MAX_OUTREACH_EXPORT_ROWS)
         throw new Error(
-          `This export matches more than ${MAX_OUTREACH_EXPORT_ROWS.toLocaleString()} contacts; narrow the filters before exporting`,
+          "This export matches more than " +
+            MAX_OUTREACH_EXPORT_ROWS.toLocaleString() +
+            " contacts; narrow the filters before exporting",
         );
-      if (candidates.length) {
-        await tx.$queryRaw`
-          SELECT "id" FROM "OutreachSequence"
-          WHERE "id" IN (${Prisma.join(
-            candidates.map((row) => Prisma.sql`${row.id}::uuid`),
-          )})
-          ORDER BY "id"
-          FOR UPDATE
-        `;
-        const stillEligible = new Set(
-          (
-            await tx.outreachSequence.findMany({
-              where: {
-                AND: [where, { id: { in: candidates.map((row) => row.id) } }],
-              },
-              select: { id: true },
-            })
-          ).map((row) => row.id),
-        );
-        candidates = candidates.filter((row) => stillEligible.has(row.id));
-      }
       const phones = [
         ...new Set(
           candidates.map((row) => row.campaignContact.contact.normalizedPhone),
         ),
       ];
-      const suppressed = new Set(
-        (
-          await tx.suppressionEntry.findMany({
-            where: { normalizedPhone: { in: phones } },
-            select: { normalizedPhone: true },
-          })
-        ).map((row) => row.normalizedPhone),
+      const campaignIds = [
+        ...new Set(candidates.map((row) => row.campaignContact.campaignId)),
+      ];
+      const [globalSuppressions, campaignSuppressions] = await Promise.all([
+        tx.suppressionEntry.findMany({
+          where: { normalizedPhone: { in: phones } },
+          select: { normalizedPhone: true },
+        }),
+        tx.campaignSuppression.findMany({
+          where: {
+            campaignId: { in: campaignIds },
+            normalizedPhone: { in: phones },
+          },
+          select: { campaignId: true, normalizedPhone: true },
+        }),
+      ]);
+      const globallyBlocked = new Set(
+        globalSuppressions.map((row) => row.normalizedPhone),
       );
-      const validCandidates = candidates.filter(
-        (candidate) =>
-          !suppressed.has(candidate.campaignContact.contact.normalizedPhone) &&
-          normalizeUSPhone(
-            candidate.campaignContact.contact.normalizedPhone,
-          ) === candidate.campaignContact.contact.normalizedPhone,
+      const campaignBlocked = new Set(
+        campaignSuppressions.map(
+          (row) => row.campaignId + "|" + row.normalizedPhone,
+        ),
       );
-      if (!validCandidates.length)
+      const valid = candidates.filter((candidate) => {
+        const phone = candidate.campaignContact.contact.normalizedPhone;
+        return (
+          !globallyBlocked.has(phone) &&
+          !campaignBlocked.has(
+            candidate.campaignContact.campaignId + "|" + phone,
+          ) &&
+          normalizeUSPhone(phone) === phone
+        );
+      });
+      if (!valid.length)
         throw new Error("No eligible contacts match this export");
 
       const campaignLabel = input.campaignId
-        ? (validCandidates[0]?.campaignContact.campaign.name ?? "campaign")
+        ? (valid[0]?.campaignContact.campaign.name ?? "campaign")
         : "all-campaigns";
       const draft = await tx.outreachExport.create({
         data: {
           idempotencyKey: input.idempotencyKey,
-          type: input.type,
+          type: "BATCH_DIALER",
           campaignId: input.campaignId,
           createdByUserId: input.user.id,
           filename: "pending.csv",
@@ -456,38 +446,42 @@ async function createOnce(input: CreateOutreachExportInput) {
           filtersSnapshot: exportFilterSnapshot(input),
         },
       });
-      if (!intentionalRepeat) {
-        await tx.outreachExportClaim.createMany({
-          data: validCandidates.map((candidate) => ({
-            sequenceId: candidate.id,
-            type: input.type,
-            firstExportId: draft.id,
-          })),
-          skipDuplicates: true,
-        });
-      }
+      // Even an intentional mixed export may contain contacts that have never
+      // been handed off before. Claim those rows now so a later ordinary
+      // export cannot accidentally include them again; existing claims remain
+      // anchored to their original export.
+      await tx.outreachExportClaim.createMany({
+        data: valid.map((candidate) => ({
+          sequenceId: candidate.id,
+          type: "BATCH_DIALER",
+          firstExportId: draft.id,
+        })),
+        skipDuplicates: true,
+      });
       const claimedIds = intentionalRepeat
-        ? new Set(validCandidates.map((candidate) => candidate.id))
+        ? new Set(valid.map((candidate) => candidate.id))
         : new Set(
             (
               await tx.outreachExportClaim.findMany({
-                where: { firstExportId: draft.id, type: input.type },
+                where: {
+                  firstExportId: draft.id,
+                  type: "BATCH_DIALER",
+                },
                 select: { sequenceId: true },
               })
             ).map((claim) => claim.sequenceId),
           );
-      const selected = validCandidates.filter((candidate) =>
+      const selected = valid.filter((candidate) =>
         claimedIds.has(candidate.id),
       );
       if (!selected.length)
         throw new Error("Every matching contact was already exported");
-
       const priorCounts = intentionalRepeat
         ? await tx.outreachExportItem.groupBy({
             by: ["sequenceId"],
             where: {
               sequenceId: { in: selected.map((row) => row.id) },
-              export: { type: input.type },
+              export: { type: "BATCH_DIALER" },
             },
             _count: { _all: true },
           })
@@ -504,7 +498,6 @@ async function createOnce(input: CreateOutreachExportInput) {
           rowSnapshot: candidateRow(
             candidate,
             draft.id,
-            input.type,
           ) as Prisma.InputJsonValue,
         })),
       });
@@ -512,18 +505,13 @@ async function createOnce(input: CreateOutreachExportInput) {
       await tx.outreachEvent.createMany({
         data: selected.map((candidate) => ({
           sequenceId: candidate.id,
-          type:
-            input.type === "SMS_ELIGIBILITY"
-              ? ("SMS_EXPORTED" as const)
-              : ("COLD_CALL_EXPORTED" as const),
-          channel:
-            input.type === "SMS_ELIGIBILITY"
-              ? ("SMS" as const)
-              : ("COLD_CALL" as const),
-          resultingState: exportedState,
+          type: "COLD_CALL_EXPORTED" as const,
+          channel: "COLD_CALL" as const,
+          resultingState: "COLD_CALL_EXPORTED" as const,
           occurredAt: now,
-          source: "outreach_export",
-          idempotencyKey: `export:${draft.id}:sequence:${candidate.id}`,
+          source: "batchdialer_export",
+          idempotencyKey:
+            "batch-export:" + draft.id + ":sequence:" + candidate.id,
           actorUserId: input.user.id,
           metadata: { intentionalRepeat },
         })),
@@ -531,20 +519,26 @@ async function createOnce(input: CreateOutreachExportInput) {
       await tx.outreachSequence.updateMany({
         where: { id: { in: selected.map((candidate) => candidate.id) } },
         data: {
-          currentState: exportedState,
+          currentState: "COLD_CALL_EXPORTED",
           lastEventAt: now,
           version: { increment: 1 },
-          ...(input.type === "SMS_ELIGIBILITY"
-            ? { smsExportedAt: now }
-            : { coldCallExportedAt: now }),
         },
       });
-      const filename = `stonegate-${
-        input.type === "SMS_ELIGIBILITY" ? "sms" : "batchdialer"
-      }-${slug(campaignLabel)}-${now.toISOString().slice(0, 10)}-${draft.id.slice(
-        0,
-        8,
-      )}.csv`;
+      await tx.outreachSequence.updateMany({
+        where: {
+          id: { in: selected.map((candidate) => candidate.id) },
+          coldCallExportedAt: null,
+        },
+        data: { coldCallExportedAt: now },
+      });
+      const filename =
+        "stonegate-batchdialer-" +
+        slug(campaignLabel) +
+        "-" +
+        now.toISOString().slice(0, 10) +
+        "-" +
+        draft.id.slice(0, 8) +
+        ".csv";
       return tx.outreachExport.update({
         where: { id: draft.id },
         data: { filename, itemCount: selected.length },
@@ -581,7 +575,7 @@ export async function createOutreachExport(input: CreateOutreachExportInput) {
       throw error;
     }
   }
-  throw new Error("Could not create export");
+  throw new Error("Could not create BatchDialer export");
 }
 
 export async function getOutreachExportCsv(exportId: string) {
@@ -589,14 +583,10 @@ export async function getOutreachExportCsv(exportId: string) {
     where: { id: exportId },
     include: { items: { orderBy: { createdAt: "asc" } } },
   });
-  if (!result) return null;
+  if (!result || result.type !== "BATCH_DIALER") return null;
   const rows = result.items.map(
     (item) => item.rowSnapshot as Record<string, string>,
   );
-  const fixedHeaders =
-    result.type === "SMS_ELIGIBILITY"
-      ? [...SMS_EXPORT_HEADERS]
-      : [...BATCH_DIALER_HEADERS];
   const originalHeaders = [
     ...new Set(
       rows.flatMap((row) =>
@@ -607,7 +597,7 @@ export async function getOutreachExportCsv(exportId: string) {
   return {
     filename: result.filename,
     csv: createCsv(
-      [...fixedHeaders, ...originalHeaders],
+      [...BATCH_DIALER_HEADERS, ...originalHeaders],
       rows,
       new Set(["Phone"]),
     ),

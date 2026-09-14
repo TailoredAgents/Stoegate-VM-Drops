@@ -13,9 +13,12 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: { default: "Stonegate VM Drops", template: "%s · Stonegate VM Drops" },
+  title: {
+    default: "Stonegate SMS Outreach",
+    template: "%s · Stonegate SMS Outreach",
+  },
   description:
-    "Personalized ringless voicemail campaign operations for Stonegate Home Buyers.",
+    "Internal SMS campaign operations and follow-up orchestration for Stonegate Home Buyers.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

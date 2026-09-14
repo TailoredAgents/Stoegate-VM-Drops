@@ -1,18 +1,19 @@
 import {
   BadgeDollarSign,
   CalendarClock,
-  Phone,
+  MessageSquareText,
   ShieldCheck,
   Users,
 } from "lucide-react";
-import { ProviderHealthPanel } from "@/components/provider-health-panel";
+
 import { calculateVABenchmarks } from "@/lib/costs";
+import { getEnv } from "@/lib/env";
 import { getAppSettings } from "@/lib/settings";
 import { formatCents } from "@/lib/utils";
 import { updateSettingsAction } from "./actions";
 
 export default async function SettingsPage() {
-  const settings = await getAppSettings();
+  const [settings, env] = await Promise.all([getAppSettings(), getEnv()]);
   const va = calculateVABenchmarks({
     hourlyRateCents: settings.va_hourly_rate_cents,
     realConversationsPerHour: settings.va_real_conversations_per_hour,
@@ -25,40 +26,32 @@ export default async function SettingsPage() {
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Settings</h1>
         <p className="mt-1 text-sm text-slate-500">
-          Sequence timing, operating limits, provider pricing, and acquisition
-          benchmarks. Provider terms remain editable and billing periods retain
-          pricing snapshots.
+          Provider-neutral SMS limits, costs, send hours, readiness notes, and
+          the human cold-calling benchmark.
         </p>
       </div>
-      <ProviderHealthPanel />
+
       <form action={updateSettingsAction} className="mt-6 space-y-5">
         <div className="grid gap-5 xl:grid-cols-2">
           <section className="card p-5">
             <h2 className="flex items-center gap-2 font-bold">
               <CalendarClock className="h-5 w-5 text-emerald-700" />
-              Sequence operations
+              Daily operations
             </h2>
             <p className="mt-1 text-xs leading-5 text-slate-500">
-              Delays are elapsed hours from durable UTC timestamps. The timezone
-              controls local operating days, windows, and billing boundaries.
+              SMS is limited by the lowest applicable campaign, application, and
+              environment cap. Business-day windows use this timezone.
             </p>
             <div className="mt-5 grid gap-4 sm:grid-cols-2">
               <SettingInput
-                label="RVM → SMS delay (hours)"
-                name="rvm_to_sms_delay_hours"
-                value={settings.rvm_to_sms_delay_hours}
-                step="0.25"
+                label="Daily SMS operating cap"
+                name="daily_sms_cap"
+                value={settings.daily_sms_cap}
               />
               <SettingInput
-                label="SMS → cold-call delay (hours)"
+                label="SMS to cold-call delay (hours)"
                 name="sms_to_cold_call_delay_hours"
                 value={settings.sms_to_cold_call_delay_hours}
-                step="0.25"
-              />
-              <SettingInput
-                label="Daily RVM operating cap"
-                name="daily_rvm_cap"
-                value={settings.daily_rvm_cap}
               />
               <TextInput
                 label="Operations timezone"
@@ -66,105 +59,106 @@ export default async function SettingsPage() {
                 value={settings.operations_timezone}
                 placeholder="America/New_York"
               />
+              <div className="hidden sm:block" />
               <TextInput
-                label="Optional send window start"
-                name="rvm_send_window_start"
-                value={settings.rvm_send_window_start}
+                label="SMS send window starts"
+                name="sms_send_window_start"
+                value={settings.sms_send_window_start}
                 type="time"
               />
               <TextInput
-                label="Optional send window end"
-                name="rvm_send_window_end"
-                value={settings.rvm_send_window_end}
+                label="SMS send window ends"
+                name="sms_send_window_end"
+                value={settings.sms_send_window_end}
                 type="time"
               />
+            </div>
+          </section>
+
+          <section className="card p-5">
+            <h2 className="flex items-center gap-2 font-bold">
+              <MessageSquareText className="h-5 w-5 text-emerald-700" />
+              Provider readiness
+            </h2>
+            <p className="mt-1 text-xs leading-5 text-slate-500">
+              These fields document operational readiness; they do not make a
+              campaign legally compliant or fabricate consent evidence.
+            </p>
+            <div className="mt-5 grid gap-4 sm:grid-cols-2">
+              <TextInput
+                label="Provider display name"
+                name="sms_provider_display_name"
+                value={settings.sms_provider_display_name}
+              />
+              <TextInput
+                label="Sender identification"
+                name="sms_sender_identification"
+                value={settings.sms_sender_identification}
+                placeholder="Brand/sender wording, if required"
+              />
+              <label className="sm:col-span-2">
+                <span className="label">Compliance/readiness notes</span>
+                <textarea
+                  className="input min-h-28"
+                  name="sms_compliance_notes"
+                  defaultValue={settings.sms_compliance_notes}
+                  placeholder="Record the reviewed requirements and evidence here."
+                />
+              </label>
             </div>
           </section>
 
           <section className="card p-5">
             <h2 className="flex items-center gap-2 font-bold">
               <BadgeDollarSign className="h-5 w-5 text-emerald-700" />
-              Drop Cowboy BYOC
+              Configurable SMS economics
             </h2>
             <p className="mt-1 text-xs leading-5 text-slate-500">
-              Current account quote: invoice = max(monthly minimum, successful
-              RVMs × success price). It is not minimum plus usage; failures and
-              compliance fees are $0 under this quote.
+              No carrier pricing is assumed. One cent equals 10,000 micros;
+              provider-reported actual variable cost overrides estimates in
+              analytics when available.
             </p>
             <div className="mt-5 grid gap-4 sm:grid-cols-2">
               <SettingInput
-                label="Monthly minimum / credit (cents)"
-                name="drop_cowboy_monthly_minimum_cents"
-                value={settings.drop_cowboy_monthly_minimum_cents}
+                label="Fixed provider fee / month (cents)"
+                name="sms_provider_fixed_monthly_fee_cents"
+                value={settings.sms_provider_fixed_monthly_fee_cents}
               />
               <SettingInput
-                label="Cents / successful RVM"
-                name="drop_cowboy_success_cost_cents"
-                value={settings.drop_cowboy_success_cost_cents}
-                step="0.0001"
+                label="Outbound message cost (micros)"
+                name="sms_cost_per_outbound_message_micros"
+                value={settings.sms_cost_per_outbound_message_micros}
               />
               <SettingInput
-                label="Billing cycle start day"
-                name="provider_billing_cycle_day"
-                value={settings.provider_billing_cycle_day}
-                max="28"
+                label="Outbound segment cost (micros)"
+                name="sms_cost_per_segment_micros"
+                value={settings.sms_cost_per_segment_micros}
               />
               <SettingInput
-                label="ElevenLabs cents / 1,000 chars"
-                name="elevenlabs_cost_per_1000_chars_cents"
-                value={settings.elevenlabs_cost_per_1000_chars_cents}
-                step="0.01"
+                label="Inbound message cost (micros)"
+                name="sms_cost_per_inbound_message_micros"
+                value={settings.sms_cost_per_inbound_message_micros}
               />
               <SettingInput
-                label="Optional infrastructure / month (cents)"
+                label="Phone number / month (cents)"
+                name="sms_phone_number_monthly_cents"
+                value={settings.sms_phone_number_monthly_cents}
+              />
+              <SettingInput
+                label="Registration / month (cents)"
+                name="sms_registration_monthly_cents"
+                value={settings.sms_registration_monthly_cents}
+              />
+              <SettingInput
+                label="Infrastructure / month (cents)"
                 name="infrastructure_monthly_overhead_cents"
                 value={settings.infrastructure_monthly_overhead_cents}
               />
-            </div>
-          </section>
-
-          <section className="card p-5">
-            <h2 className="flex items-center gap-2 font-bold">
-              <Phone className="h-5 w-5 text-emerald-700" />
-              Generic carrier forecast
-            </h2>
-            <p className="mt-1 text-xs leading-5 text-slate-500">
-              Seeded from the current Twilio BYOC estimate. Duration remains
-              explicitly estimated until actual carrier minutes are imported.
-            </p>
-            <div className="mt-5 grid gap-4 sm:grid-cols-2">
-              <TextInput
-                label="Carrier label"
-                name="carrier_provider_name"
-                value={settings.carrier_provider_name}
-              />
               <SettingInput
-                label="Monthly SIP trunk (cents)"
-                name="carrier_trunk_monthly_cents"
-                value={settings.carrier_trunk_monthly_cents}
-              />
-              <SettingInput
-                label="Monthly cost / DID (cents)"
-                name="carrier_did_monthly_cents"
-                value={settings.carrier_did_monthly_cents}
-                step="0.01"
-              />
-              <SettingInput
-                label="Active RVM DIDs"
-                name="carrier_active_did_count"
-                value={settings.carrier_active_did_count}
-              />
-              <SettingInput
-                label="Blended cents / minute"
-                name="carrier_voice_cents_per_minute"
-                value={settings.carrier_voice_cents_per_minute}
-                step="0.0001"
-              />
-              <SettingInput
-                label="Estimated seconds / attempt"
-                name="carrier_average_seconds_per_attempt"
-                value={settings.carrier_average_seconds_per_attempt}
-                step="0.1"
+                label="Billing-cycle start day"
+                name="provider_billing_cycle_day"
+                value={settings.provider_billing_cycle_day}
+                max="28"
               />
             </div>
           </section>
@@ -172,53 +166,47 @@ export default async function SettingsPage() {
           <section className="card p-5">
             <h2 className="flex items-center gap-2 font-bold">
               <Users className="h-5 w-5 text-emerald-700" />
-              VA benchmarks
+              VA cold-call benchmark
             </h2>
             <div className="mt-5 grid gap-4 sm:grid-cols-2">
               <SettingInput
                 label="VA hourly rate (cents)"
                 name="va_hourly_rate_cents"
                 value={settings.va_hourly_rate_cents}
+                step="0.01"
               />
               <SettingInput
                 label="Real conversations / hour"
                 name="va_real_conversations_per_hour"
                 value={settings.va_real_conversations_per_hour}
+                step="0.01"
               />
               <SettingInput
                 label="Conversations / lead"
                 name="va_real_conversations_per_lead"
                 value={settings.va_real_conversations_per_lead}
+                step="0.01"
               />
               <SettingInput
                 label="Leads / deal"
                 name="va_leads_per_deal"
                 value={settings.va_leads_per_deal}
+                step="0.01"
               />
             </div>
             <div className="mt-5 grid grid-cols-3 gap-2 rounded-lg bg-slate-50 p-3 text-center">
-              <div>
-                <p className="text-[10px] uppercase text-slate-500">
-                  Conversation
-                </p>
-                <strong className="text-sm">
-                  {formatCents(va.vaCostPerConversationCents)}
-                </strong>
-              </div>
-              <div>
-                <p className="text-[10px] uppercase text-slate-500">Lead</p>
-                <strong className="text-sm">
-                  {formatCents(va.vaCostPerQualifiedLeadCents)}
-                </strong>
-              </div>
-              <div>
-                <p className="text-[10px] uppercase text-slate-500">
-                  Deal labor
-                </p>
-                <strong className="text-sm">
-                  {formatCents(va.vaExpectedLaborCostPerDealCents)}
-                </strong>
-              </div>
+              <Benchmark
+                label="Conversation"
+                value={va.vaCostPerConversationCents}
+              />
+              <Benchmark
+                label="Qualified lead"
+                value={va.vaCostPerQualifiedLeadCents}
+              />
+              <Benchmark
+                label="Deal labor"
+                value={va.vaExpectedLaborCostPerDealCents}
+              />
             </div>
           </section>
         </div>
@@ -227,19 +215,16 @@ export default async function SettingsPage() {
           <div className="flex items-center gap-3">
             <ShieldCheck className="h-5 w-5 text-emerald-700" />
             <div>
-              <p className="text-sm font-semibold text-emerald-900">
-                Live RVM:{" "}
-                {process.env.RVM_LIVE_SENDS_ENABLED === "true"
-                  ? "enabled"
-                  : "disabled"}
-                {" · "}environment campaign cap{" "}
-                {process.env.MAX_LIVE_CAMPAIGN_SEND_LIMIT ?? "10"}
-                {" · "}daily cap{" "}
-                {process.env.MAX_LIVE_DAILY_RVM_ATTEMPTS ?? "10"}
+              <p className="text-sm font-semibold text-emerald-950">
+                Live SMS {env.SMS_LIVE_SENDS_ENABLED ? "enabled" : "disabled"}
+                {" · provider "}
+                {env.SMS_PROVIDER}
               </p>
-              <p className="text-xs text-emerald-700">
-                Environment guards remain authoritative and cannot be raised
-                here.
+              <p className="text-xs text-emerald-800">
+                Environment ceilings:{" "}
+                {env.MAX_LIVE_SMS_CAMPAIGN_LIMIT.toLocaleString()} per campaign
+                and {env.MAX_LIVE_DAILY_SMS_LIMIT.toLocaleString()} per day.
+                Environment guards cannot be raised here.
               </p>
             </div>
           </div>
@@ -249,6 +234,15 @@ export default async function SettingsPage() {
         </div>
       </form>
     </>
+  );
+}
+
+function Benchmark({ label, value }: { label: string; value: number }) {
+  return (
+    <div>
+      <p className="text-[10px] uppercase text-slate-500">{label}</p>
+      <strong className="text-sm">{formatCents(value)}</strong>
+    </div>
   );
 }
 

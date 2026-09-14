@@ -1,49 +1,142 @@
-# Stonegate VM Drops — Build Plan
+# Stonegate SMS Outreach — Build Plan
 
 ## Product boundary
 
-Stonegate VM Drops is a standalone, single-organization application for importing outreach data, rendering personalized voicemail scripts, generating and storing audio, submitting ringless voicemail drops, orchestrating external follow-up eligibility, tracking attributed outcomes, and measuring unit economics. It does not implement SMS delivery, outbound conversational calling, the human dialer, or the existing callback agent/CRM.
+Stonegate SMS Outreach is a standalone, single-organization application for
+SMS campaign operations. Its target scope is contact/property import,
+suppression, message review, guarded campaign execution, provider-event and
+reply tracking, attributed outcomes, cold-call handoff, and operational
+reporting.
+
+It is not a conversational calling agent, a human dialer, or a general CRM.
+Production SMS transport is intentionally out of scope until Stonegate selects
+a provider and completes the required technical, operational, and legal
+review.
+
+## Migration status
+
+The repository has pivoted from the archived voicemail implementation. Old
+database names and historical records remain only where needed for safe,
+non-destructive migration and rollback. They are not wired into the active SMS
+execution path or presented as current provider configuration.
+
+The previous implementation is retained at `archive/rvm-v1`; see
+`RVM_ARCHIVE.md` for its source commit and status.
 
 ## Architecture decisions
 
-- **Runtime:** strict TypeScript on Next.js App Router. The same repository runs as a Render web service and a separate `tsx` background worker.
-- **Persistence:** Render PostgreSQL is the only system of record. Prisma owns application tables and migrations; pg-boss owns its queue schema in the same database. No Redis and no persistent local disk.
-- **Long-running work:** HTTP requests validate, persist state, and enqueue durable jobs. The worker handles preview/bulk audio generation and delivery. Queue keys and database uniqueness constraints make work idempotent.
-- **Outreach state:** campaign/audio/RVM execution status remains separate from one `OutreachSequence` projection per campaign contact. Append-only `OutreachEvent` rows explain every transition. The projection and event are committed atomically.
-- **Eligibility timing:** successful live RVM delivery snapshots a configurable 24-hour SMS due timestamp. Only a confirmed external SMS send snapshots a configurable 48-hour cold-call due timestamp; failures remain retry/manual-review exceptions. A recurring pg-boss reconciler materializes due states from PostgreSQL; restarts cannot lose timers.
-- **External handoffs:** SMS and BatchDialer CSV exports are authenticated POST mutations with idempotency keys, immutable row snapshots, first-export claims, and explicit audited repeat exports. CSV is streamed from PostgreSQL, never Render disk. There is no SMS provider or cold-call provider in this phase.
-- **Outcome safety:** any callback/response exits later prospecting. Opt-out, provider DNC, wrong-number, lead, follow-up, contract, and closed states cannot enter downstream export queries. Export-time suppression and normalized-phone checks are defense in depth.
-- **Daily operation:** a PostgreSQL ledger atomically reserves each live RVM attempt against the lower of the editable 2,000/day operating cap and the environment-only daily ceiling. Optional local send windows use an IANA timezone; deferred jobs remain durable.
-- **Provider boundary:** business logic depends only on `TTSProvider`, `AudioStorageProvider`, and `RVMProvider`. ElevenLabs, Cloudflare R2, and Drop Cowboy are isolated adapters. RVM media is a typed hosted-URL/recording-ID union so transport changes stay inside the provider boundary.
-- **Audio reuse:** rendered text + voice + model are hashed. Audio assets have deterministic R2 keys and unique cache constraints, so delivery retries never regenerate approved audio.
-- **Imports:** uploaded CSV/XLSX data is staged in PostgreSQL, with every original row retained as JSONB. The browser receives summaries and samples only. Commit operates in chunks and links one contact/phone to any number of properties.
-- **Authentication:** database-backed users, bcrypt password hashes, random opaque session tokens stored only as SHA-256 hashes, and HTTP-only same-site cookies. A bootstrap command creates the initial admin. Mutation routes enforce same-origin requests.
-- **Integration API:** a constant-time API-key check protects callback lookup/result endpoints. Recent delivered drops drive deterministic matched/ambiguous responses.
-- **Money:** billable ElevenLabs generation snapshots are counted once and cache/retry reuse is visible. Provider billing periods snapshot editable pricing. Drop Cowboy is modeled as `max(monthly minimum, successful usage)`, not minimum plus usage. Shared minimum and carrier fixed costs use deterministic largest-remainder allocation; sub-cent carrier rates retain fractional precision until aggregate rounding.
-- **External API certainty:** provider request/response parsing uses Zod. The Drop Cowboy adapter follows its published `/v1/rvm` `audio_url` contract; live use requires Drop Cowboy approval for externally hosted audio.
+- **Runtime:** strict TypeScript on Next.js App Router. Render runs one web
+  service and one background worker from this repository.
+- **Persistence:** PostgreSQL is the system of record. Prisma owns application
+  migrations, and pg-boss owns durable work queues in the same database.
+- **Durability:** state transitions, provider identities, timestamps, and
+  idempotency keys are persisted. A restart must not lose scheduled work or
+  duplicate a confirmed send.
+- **SMS boundary:** campaign logic depends on a provider-neutral interface.
+  `dry-run` is the only selected adapter until a separate provider decision is
+  completed.
+- **Safety switches:** live sending requires both a future production-capable
+  adapter and `SMS_LIVE_SENDS_ENABLED=true`. Checked-in configuration keeps the
+  switch false.
+- **Limits:** the application enforces a normal daily target separately from
+  environment-only campaign and daily live ceilings.
+- **Eligibility timing:** only a confirmed SMS send may snapshot the
+  configurable 48-hour cold-call due time. A queue, preview, or export is not a
+  send.
+- **Suppression:** import, pre-send, and outcome processing all apply global
+  normalized-phone suppression. Opt-out, DNC, and wrong-number results stop
+  later touches.
+- **Auditing:** ordinary and intentional-repeat exports retain immutable row
+  snapshots. Outcome imports use preview, explicit confirmation, stable
+  identity, and duplicate detection.
+- **Authentication:** database-backed users, hashed opaque sessions, role
+  checks, and same-origin validation guard mutations.
+- **Infrastructure:** existing Render resource identifiers remain stable during
+  the product rename to avoid replacing the database or services.
 
 ## Delivery phases
 
-1. Scaffold Next.js, validated environment configuration, Prisma schema, initial migration, and seed/bootstrap tooling.
-2. Implement phone normalization, import parsing/mapping, deduplication, suppression filtering, safe Handlebars rendering, state transitions, callback matching, and analytics.
-3. Add provider interfaces plus ElevenLabs, private R2, Drop Cowboy, and dry-run adapters.
-4. Add pg-boss queues and an idempotent worker for preparation, audio, sending, and retries.
-5. Add authenticated operational UI: dashboard, campaigns, guided import, detail/approval/launch, scripts and voices, suppression, and settings.
-6. Add health, webhook, and Stonegate callback integration endpoints.
-7. Add focused tests, Render Blueprint, environment template, runbook, and production checklist.
-8. Add the post-RVM orchestration phase: sequence/event projection, durable 24/48-hour eligibility, external SMS tracking, BatchDialer exports, outcome imports, daily RVM ledger/window, channel attribution, monthly BYOC/carrier economics, and Today operations UI.
+1. **Complete:** preserve the previous product in `archive/rvm-v1` and record
+   its source commit.
+2. **Complete:** rebrand package metadata, application chrome, documentation,
+   and environment templates to Stonegate SMS Outreach.
+3. **Complete:** remove archived provider execution from active configuration
+   and establish the provider-neutral SMS dry-run contract.
+4. **Complete:** align the data model and workflow with versioned templates,
+   SMS messages, attempts, provider events, replies, suppression, attribution,
+   and cold-call eligibility.
+5. **Complete:** prove list import, campaign review, dry-run execution, restart
+   safety, idempotency, outcome import, and export behavior with focused and
+   PostgreSQL integration tests.
+6. **Pending provider decision:** evaluate candidate SMS providers against the
+   decision record. Select one
+   only after current official documentation and account-specific behavior have
+   been verified.
+7. **Blocked on step 6:** implement the selected provider adapter,
+   provider-specific webhook mapping/authentication, rate limiting, and
+   diagnostics against the existing canonical webhook/reconciliation layer.
+8. **Blocked on steps 6-7:** complete operational and legal review, then run a
+   deliberately limited live acceptance campaign before raising either hard
+   ceiling.
+
+## Required dry-run configuration
+
+```text
+SMS_LIVE_SENDS_ENABLED=false
+SMS_PROVIDER=dry-run
+DEFAULT_DAILY_SMS_LIMIT=2000
+MAX_LIVE_SMS_CAMPAIGN_LIMIT=10
+MAX_LIVE_DAILY_SMS_LIMIT=10
+DEFAULT_SMS_TO_COLD_CALL_DELAY_HOURS=48
+```
+
+No production provider credential belongs in the repository. Provider-specific
+variables are added only with the selected adapter and its reviewed runbook.
 
 ## Operational safeguards
 
-- Campaigns must follow `DRAFT → DATA_READY → PREVIEW_GENERATING → PREVIEW_READY → APPROVED → QUEUED → SENDING → COMPLETED`, with explicit pause/failure paths.
-- `RVM_LIVE_SENDS_ENABLED` defaults to false. `AUDIO_GENERATION_LIVE_ENABLED` can independently validate ElevenLabs/R2 without enabling RVM. Live launch requires an authenticated admin, typed confirmation, approved preview, campaign limit, and environment ceiling.
-- Suppression is checked during import and again immediately before each send.
-- Suppression and response outcomes also terminate every open sequence for the normalized phone; eligibility reconciliation and export queries independently require a nonterminal, unsuppressed row.
-- Only the existing guarded RVM worker can call the RVM provider. The sequence reconciler has no provider dependency. Dry-run drops never enter downstream eligibility or the live daily ledger.
-- `MAX_LIVE_CAMPAIGN_SEND_LIMIT` and `MAX_LIVE_DAILY_RVM_ATTEMPTS` remain environment-only hard ceilings during the 10 → small batch → 500 → 1,000 → 2,000 ramp.
-- Workers use bounded concurrency, chunked queries, exponential retry backoff, structured correlation IDs, and per-contact failure recording. A durable pre-request marker makes live RVM submission at-most-once across ambiguous timeouts/restarts.
-- The public provider webhook fails closed until its signing secret is configured. Raw payloads are preserved, duplicate deliveries are ignored safely, and out-of-order events cannot regress a final delivery projection; DNC still always wins.
+- Dry-run remains the default locally and on both Render services.
+- Live-send authorization is admin-only and requires an explicit confirmation
+  at the final campaign boundary.
+- The worker rechecks the live switch, selected provider, campaign approval,
+  hard limits, phone normalization, and suppression immediately before any
+  future provider call.
+- A durable reservation/idempotency marker is committed before ambiguous
+  network work. Retries never assume an unknown provider result is safe to send
+  again.
+- Provider webhooks fail closed until authentication is configured and tested.
+  Raw events are retained, replay is harmless, and a later low-priority event
+  cannot regress a final outcome.
+- Responses and suppression outcomes prevent cold-call eligibility. Repeated
+  `sent` events cannot reset an already-running delay.
+- Workers use bounded concurrency, chunked queries, retry backoff, and
+  per-contact errors rather than one unbounded campaign transaction.
+- Render disk is ephemeral and is not a source of campaign or export state.
 
-## Production readiness gate
+## Provider decision gate
 
-Before the first live send: deploy migrations, create admin credentials, confirm the outreach reconciler is scheduled, configure private R2 CORS/credentials, obtain Drop Cowboy approval for `audio_url` and exact BYOC request/account behavior, configure and test webhook signing, verify the registered brand and callback number, set real pricing, map a controlled CSV once in the external SMS tool and BatchDialer, run a consented small test list, and only then enable `RVM_LIVE_SENDS_ENABLED=true`. Twilio Messaging is not required and must not be configured for this phase.
+Provider selection remains unfinished. Before implementation, document and
+test at least:
+
+- outbound API authentication and idempotency behavior;
+- message and sender registration requirements;
+- throughput, queueing, retry, and error semantics;
+- provider message identifiers and status lifecycle;
+- signed delivery, inbound reply, opt-out, and DNC events;
+- timestamp precision and ordering behavior;
+- account-specific pricing and reporting fields;
+- sandbox/test-number support and production activation steps.
+
+No provider should be described as selected until these checks are complete.
+
+## Live-readiness gate
+
+Before any production send, Stonegate must complete provider selection, account
+setup, sender registration, webhook verification, data-retention review,
+message-content review, suppression testing, monitoring, rollback planning, and
+its own consent and jurisdiction analysis. These gates reduce operational risk;
+they do not constitute a claim of legal compliance.
+
+The first live campaign remains capped by both 10-message environment ceilings.
+Raise a ceiling only after reviewing the prior batch's provider events,
+responses, suppression behavior, timing, and costs.

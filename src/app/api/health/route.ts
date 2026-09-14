@@ -10,7 +10,7 @@ export async function GET() {
     return Response.json(
       {
         status: "degraded",
-        service: "stonegate-vm-drops",
+        service: "stonegate-sms-outreach",
         configuration: "invalid",
         error:
           error instanceof Error
@@ -24,14 +24,14 @@ export async function GET() {
     await db.$queryRaw`SELECT 1`;
     return Response.json({
       status: "ok",
-      service: "stonegate-vm-drops",
+      service: "stonegate-sms-outreach",
       database: "healthy",
     });
   } catch {
     return Response.json(
       {
         status: "degraded",
-        service: "stonegate-vm-drops",
+        service: "stonegate-sms-outreach",
         database: "unhealthy",
       },
       { status: 503 },

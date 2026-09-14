@@ -1,10 +1,9 @@
 import { getEnv } from "@/lib/env";
 import { logger } from "@/lib/logger";
 import {
-  handleGenerateAudio,
   handlePrepareCampaign,
   handleReconcileOutreach,
-  handleSendDrop,
+  handleSendSms,
 } from "@/jobs/handlers";
 import { getBoss, QUEUES, startBoss } from "@/jobs/queues";
 
@@ -15,11 +14,8 @@ async function main() {
   await boss.work(QUEUES.prepareCampaign, workerOptions, async (jobs) =>
     Promise.all(jobs.map(handlePrepareCampaign)),
   );
-  await boss.work(QUEUES.generateAudio, workerOptions, async (jobs) =>
-    Promise.all(jobs.map(handleGenerateAudio)),
-  );
-  await boss.work(QUEUES.sendDrop, workerOptions, async (jobs) =>
-    Promise.all(jobs.map(handleSendDrop)),
+  await boss.work(QUEUES.sendSms, workerOptions, async (jobs) =>
+    Promise.all(jobs.map(handleSendSms)),
   );
   await boss.work(
     QUEUES.reconcileOutreach,
@@ -29,14 +25,14 @@ async function main() {
   logger.info(
     {
       concurrency: env.WORKER_CONCURRENCY,
-      realAudio: env.AUDIO_GENERATION_LIVE_ENABLED,
-      liveSends: env.RVM_LIVE_SENDS_ENABLED,
+      smsProvider: env.SMS_PROVIDER,
+      liveSms: env.SMS_LIVE_SENDS_ENABLED,
     },
-    "worker started",
+    "SMS worker started",
   );
 
   const shutdown = async (signal: string) => {
-    logger.info({ signal }, "worker shutting down");
+    logger.info({ signal }, "SMS worker shutting down");
     await getBoss().stop({ graceful: true, timeout: 25_000 });
     process.exit(0);
   };
@@ -45,6 +41,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  logger.fatal({ error }, "worker failed to start");
+  logger.fatal({ error }, "SMS worker failed to start");
   process.exit(1);
 });

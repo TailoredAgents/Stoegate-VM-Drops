@@ -1,929 +1,1031 @@
-import { randomUUID } from "node:crypto";
-import { PgBoss } from "pg-boss";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { GET as callbackLookupEndpoint } from "@/app/api/integrations/callback-lookup/route";
-import { POST as callbackResultEndpoint } from "@/app/api/integrations/callback-result/route";
-import { getCampaignMetrics } from "@/lib/analytics";
-import { db } from "@/lib/db";
-import { createOutreachExport } from "@/lib/outreach-exports";
-import {
-  ensureOutreachSequence,
-  reconcileDueOutreach,
-  recordExternalOutcomeTx,
-  recordRvmSentTx,
-} from "@/lib/outreach-service";
-import { processDropCowboyWebhook } from "@/lib/webhooks";
+import { createHash, randomUUID } from "node:crypto";
 
-const prefix = `integration-${randomUUID()}`;
-const phones = ["+12025550101", "+12025550102", "+12025550103"];
-const integrationHeaders = {
-  authorization: "Bearer integration-test-api-key-32-chars",
-  "content-type": "application/json",
-};
-let campaignId: string;
-let contactIds: string[];
-let campaignContactIds: string[];
-let dropIds: string[];
-let propertyIds: string[];
-let adminId: string;
+import type {
+  CampaignContactStatus,
+  OutreachSequenceState,
+  SmsMessageStatus,
+} from "@prisma/client";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { db } from "@/lib/db";
+import {
+  importColdCallOutcomes,
+  previewColdCallOutcomes,
+} from "@/lib/outcome-imports";
+import {
+  createOutreachExport,
+  getOutreachExportCsv,
+} from "@/lib/outreach-exports";
+import {
+  persistDryRunSmsResult,
+  persistLiveSmsProviderResult,
+} from "@/lib/sms-operations";
+import { recordSmsInboundMessage } from "@/lib/sms-conversations";
+import { ensureSmsSequenceTx, reconcileSmsOutreach } from "@/lib/sms-outreach";
+import {
+  processCanonicalSmsWebhook,
+  reconcileSynchronousSmsProviderResults,
+} from "@/lib/sms-webhooks";
+import { DryRunSMSProvider } from "@/providers/sms-dry-run";
+
+const prefix = `sms-integration-${randomUUID()}`;
+const providerKey = `${prefix}-provider`;
+const senderPhone = "+12025550999";
+const templateBody =
+  "Hi {{first_name}}, are you open to an offer for {{property_address}}?";
+const phoneAreaCodes = ["202", "212", "305", "312", "404", "512", "617", "770"];
+let phoneSlot = Number.parseInt(randomUUID().slice(0, 6), 16) % 800;
+
+let adminId = "";
+let campaignId = "";
+let templateId = "";
+let templateVersionId = "";
+const contactIds: string[] = [];
+const propertyIds: string[] = [];
+const phones: string[] = [];
+
+function sha256(value: string) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function addHours(value: Date, hours: number) {
+  return new Date(value.getTime() + hours * 60 * 60 * 1000);
+}
+
+async function nextUnusedPhone() {
+  for (let attempt = 0; attempt < 800; attempt += 1) {
+    const slot = (phoneSlot + attempt) % 800;
+    const areaCode = phoneAreaCodes[Math.floor(slot / 100)];
+    const lineNumber = String(100 + (slot % 100)).padStart(4, "0");
+    const phone = `+1${areaCode}555${lineNumber}`;
+    const exists = await db.contact.findUnique({
+      where: { normalizedPhone: phone },
+      select: { id: true },
+    });
+    if (!exists) {
+      phoneSlot = slot + 1;
+      phones.push(phone);
+      return phone;
+    }
+  }
+  throw new Error("Could not reserve an unused integration-test phone");
+}
+
+interface SmsFixtureOptions {
+  anchor?: Date;
+  contact?: { id: string; phone: string };
+  messageStatus?: SmsMessageStatus;
+  campaignContactStatus?: CampaignContactStatus;
+  sequenceState?: OutreachSequenceState;
+  providerMessageId?: string;
+  acceptedAt?: Date | null;
+  sentAt?: Date | null;
+  deliveredAt?: Date | null;
+  smsSentAt?: Date | null;
+  coldCallDueAt?: Date | null;
+  coldCallEligibleAt?: Date | null;
+}
+
+async function createSmsFixture(
+  label: string,
+  options: SmsFixtureOptions = {},
+) {
+  const anchor = options.anchor ?? new Date("2030-01-01T15:00:00.000Z");
+  const source = `${prefix}-${label}`;
+  const existingContact = options.contact;
+  const phone = existingContact?.phone ?? (await nextUnusedPhone());
+  const contact = existingContact
+    ? { id: existingContact.id, normalizedPhone: existingContact.phone }
+    : await db.contact.create({
+        data: {
+          normalizedPhone: phone,
+          firstName: "Sam",
+          lastName: label,
+          ownerName: `Sam ${label}`,
+          source,
+        },
+      });
+  if (!existingContact) contactIds.push(contact.id);
+
+  const property = await db.property.create({
+    data: {
+      propertyAddress: `${propertyIds.length + 1} Integration Way`,
+      streetName: "Integration Way",
+      city: "Testville",
+      state: "VA",
+      postalCode: "22101",
+      county: "Fairfax",
+      propertyType: "House",
+      source,
+    },
+  });
+  propertyIds.push(property.id);
+
+  const campaignContact = await db.campaignContact.create({
+    data: {
+      campaignId,
+      contactId: contact.id,
+      propertyId: property.id,
+      status: options.campaignContactStatus ?? "QUEUED",
+      selectedForSend: true,
+      renderedText: `Hi Sam, are you open to an offer for ${property.propertyAddress}?`,
+    },
+  });
+  const sequence = await db.$transaction((tx) =>
+    ensureSmsSequenceTx(tx, campaignContact.id, 48),
+  );
+  const smsSentAt = options.smsSentAt ?? options.sentAt ?? null;
+  const coldCallDueAt =
+    options.coldCallDueAt === undefined
+      ? smsSentAt
+        ? addHours(smsSentAt, 48)
+        : null
+      : options.coldCallDueAt;
+  const sequenceState = options.sequenceState ?? "SMS_QUEUED";
+  const updatedSequence = await db.outreachSequence.update({
+    where: { id: sequence.id },
+    data: {
+      currentState: sequenceState,
+      smsScheduledFor: anchor,
+      smsSentAt,
+      smsToColdCallDelayHours: 48,
+      coldCallDueAt,
+      coldCallEligibleAt: options.coldCallEligibleAt ?? null,
+      nextEligibleAt:
+        sequenceState === "COLD_CALL_ELIGIBLE" ? null : coldCallDueAt,
+      terminalAt: null,
+      terminalReason: null,
+      lastEventAt: anchor,
+    },
+  });
+
+  const consent = await db.smsConsentEvidence.create({
+    data: {
+      contactId: contact.id,
+      campaignId,
+      campaignContactId: campaignContact.id,
+      normalizedPhone: phone,
+      status: "VERIFIED",
+      basis: "EXPRESS_WRITTEN",
+      source: "integration_test",
+      disclosureText: "Integration-only consent fixture",
+      evidence: { test: true, label },
+      capturedAt: addHours(anchor, -24),
+      createdByUserId: adminId,
+    },
+  });
+  const renderedBody = `Hi Sam, are you open to an offer for ${property.propertyAddress}?`;
+  const messageStatus = options.messageStatus ?? "QUEUED";
+  const message = await db.smsOutboundMessage.create({
+    data: {
+      campaignContactId: campaignContact.id,
+      sequenceId: updatedSequence.id,
+      templateVersionId,
+      consentEvidenceId: consent.id,
+      sequenceNumber: 1,
+      idempotencyKey: `${prefix}:${label}:message`,
+      toPhone: phone,
+      fromPhone: senderPhone,
+      renderedBody,
+      bodyHash: sha256(renderedBody),
+      segmentCount: 1,
+      estimatedCostMicros: 800,
+      currency: "USD",
+      complianceSnapshot: { consentEvidenceId: consent.id, test: true },
+      suppressionCheckedAt: anchor,
+      scheduledFor: anchor,
+      queuedAt: anchor,
+      providerKey: options.providerMessageId ? providerKey : null,
+      providerMessageId: options.providerMessageId,
+      providerStatus: options.providerMessageId
+        ? messageStatus.toLowerCase()
+        : null,
+      status: messageStatus,
+      acceptedAt: options.acceptedAt ?? null,
+      sentAt: options.sentAt ?? null,
+      deliveredAt: options.deliveredAt ?? null,
+    },
+  });
+
+  return {
+    source,
+    phone,
+    contactId: contact.id,
+    propertyId: property.id,
+    campaignContactId: campaignContact.id,
+    sequenceId: updatedSequence.id,
+    consentId: consent.id,
+    messageId: message.id,
+  };
+}
 
 beforeAll(async () => {
   await db.$queryRaw`SELECT 1`;
   const admin = await db.user.create({
     data: {
       email: `${prefix}@example.com`,
-      passwordHash: "integration-only",
+      passwordHash: "integration-only-not-a-login",
       role: "ADMIN",
     },
   });
   adminId = admin.id;
-  const template = await db.scriptTemplate.create({
+
+  const template = await db.smsTemplate.create({
     data: {
       name: `${prefix}-template`,
-      versions: { create: { version: 1, body: "Hello {{first_name}}" } },
+      description: "SMS integration template",
+      createdByUserId: admin.id,
+      versions: {
+        create: {
+          version: 1,
+          body: templateBody,
+          contentHash: sha256(templateBody),
+          status: "APPROVED",
+          createdByUserId: admin.id,
+          approvedByUserId: admin.id,
+          approvedAt: new Date("2029-12-01T15:00:00.000Z"),
+        },
+      },
     },
     include: { versions: true },
   });
-  const voice = await db.voiceConfiguration.create({
-    data: {
-      name: `${prefix}-voice`,
-      voiceId: "integration-voice",
-      modelId: "integration-model",
-    },
-  });
+  templateId = template.id;
+  templateVersionId = template.versions[0].id;
+
   const campaign = await db.campaign.create({
     data: {
       name: `${prefix}-campaign`,
+      sourceName: `${prefix}-campaign-source`,
+      kind: "SMS",
       status: "SENDING",
-      sendLimit: 10,
-      approvedAt: new Date(),
-      launchedAt: new Date(),
-      launchedByUserId: adminId,
-      scriptTemplateVersionId: template.versions[0].id,
-      voiceConfigurationId: voice.id,
+      sendLimit: 100,
+      smsDailyCap: 100,
+      smsTemplateVersionId: templateVersionId,
+      smsProviderKey: providerKey,
+      smsSenderRef: senderPhone,
+      smsProviderConfig: { test: true },
+      smsCostConfig: { costPerSegmentMicros: 800 },
+      smsScheduleTimezone: "America/New_York",
+      smsEstimatedCostPerSegmentMicros: 800,
+      smsCurrency: "USD",
+      smsComplianceStatus: "APPROVED",
+      smsComplianceNotes: "Integration-only approved fixture",
+      smsColdCallDelayHours: 48,
+      createdByUserId: admin.id,
+      approvedAt: new Date("2029-12-01T16:00:00.000Z"),
+      approvedByUserId: admin.id,
+      launchedAt: new Date("2029-12-02T15:00:00.000Z"),
+      launchedByUserId: admin.id,
     },
   });
   campaignId = campaign.id;
-  const contacts = await Promise.all([
-    db.contact.create({
-      data: { normalizedPhone: phones[0], firstName: "Test" },
-    }),
-    db.contact.create({
-      data: { normalizedPhone: phones[1], firstName: "Dnc" },
-    }),
-    db.contact.create({
-      data: { normalizedPhone: phones[2], firstName: "Unique" },
-    }),
-  ]);
-  contactIds = contacts.map((contact) => contact.id);
-
-  campaignContactIds = [];
-  dropIds = [];
-  propertyIds = [];
-  for (let index = 0; index < 5; index += 1) {
-    const property = await db.property.create({
-      data: {
-        propertyAddress: `${index + 1} Test Street`,
-        city: "Testville",
-        state: "VA",
-      },
-    });
-    propertyIds.push(property.id);
-    const campaignContact = await db.campaignContact.create({
-      data: {
-        campaignId,
-        contactId:
-          index === 3
-            ? contactIds[1]
-            : index === 4
-              ? contactIds[2]
-              : contactIds[0],
-        propertyId: property.id,
-        status: "QUEUED",
-        selectedForSend: true,
-      },
-    });
-    const generatedAt = new Date();
-    const audio = await db.audioAsset.create({
-      data: {
-        campaignContactId: campaignContact.id,
-        scriptTemplateVersionId: template.versions[0].id,
-        voiceConfigurationId: voice.id,
-        renderedText: `Hello ${index}`,
-        textHash: `${prefix}-${index}`,
-        voiceId: voice.voiceId,
-        modelId: voice.modelId,
-        characterCount: 7,
-        objectKey: `${prefix}/${index}.mp3`,
-        contentType: "audio/mpeg",
-        status: "READY",
-        estimatedCostCents: 1,
-        generatedAt,
-      },
-    });
-    await db.audioGenerationUsage.create({
-      data: {
-        audioAssetId: audio.id,
-        provider: "elevenlabs",
-        characterCount: 7,
-        estimatedCostCents: 1,
-        billingDisposition: "BILLABLE_GENERATION",
-        generatedAt,
-        storedAt: generatedAt,
-      },
-    });
-    const delivered = index < 2 || index === 4;
-    const drop = await db.drop.create({
-      data: {
-        campaignContactId: campaignContact.id,
-        audioAssetId: audio.id,
-        status: delivered ? "DELIVERED" : "QUEUED",
-        queuedAt: new Date(),
-        deliveredAt: delivered ? new Date(Date.now() - index * 1_000) : null,
-      },
-    });
-    campaignContactIds.push(campaignContact.id);
-    dropIds.push(drop.id);
-    await ensureOutreachSequence(campaignContact.id);
-  }
 });
 
 afterAll(async () => {
-  await db.callbackOutcome.deleteMany({
-    where: { idempotencyKey: { startsWith: prefix } },
-  });
-  await db.outreachExport.deleteMany({
-    where: { idempotencyKey: { startsWith: prefix } },
-  });
-  await db.suppressionEntry.deleteMany({
-    where: { normalizedPhone: { in: phones } },
-  });
-  await db.campaign.deleteMany({ where: { id: campaignId } });
-  await db.contact.deleteMany({ where: { id: { in: contactIds } } });
-  await db.property.deleteMany({ where: { id: { in: propertyIds } } });
-  await db.voiceConfiguration.deleteMany({
-    where: { name: `${prefix}-voice` },
-  });
-  await db.scriptTemplate.deleteMany({ where: { name: `${prefix}-template` } });
-  await db.user.deleteMany({ where: { id: adminId } });
-  await db.$disconnect();
+  try {
+    const outcomeImportIds = (
+      await db.externalOutcomeImport.findMany({
+        where: { fileName: { startsWith: prefix } },
+        select: { id: true },
+      })
+    ).map((row) => row.id);
+    if (outcomeImportIds.length) {
+      await db.smsAuditEvent.deleteMany({
+        where: {
+          entityType: "ExternalOutcomeImport",
+          entityId: { in: outcomeImportIds },
+        },
+      });
+      await db.externalOutcomeImport.deleteMany({
+        where: { id: { in: outcomeImportIds } },
+      });
+    }
+    const dailyUsageIds = campaignId
+      ? (
+          await db.smsDailyUsage.findMany({
+            where: {
+              entries: {
+                some: {
+                  message: {
+                    campaignContact: { campaignId },
+                  },
+                },
+              },
+            },
+            select: { id: true },
+          })
+        ).map((row) => row.id)
+      : [];
+
+    if (campaignId) {
+      await db.outreachExport.deleteMany({
+        where: { idempotencyKey: { startsWith: prefix } },
+      });
+      await db.smsAuditEvent.deleteMany({ where: { campaignId } });
+    }
+    await db.smsInboundMessage.deleteMany({ where: { providerKey } });
+    await db.smsStatusEvent.deleteMany({ where: { providerKey } });
+    if (phones.length)
+      await db.suppressionEntry.deleteMany({
+        where: { normalizedPhone: { in: phones } },
+      });
+    if (campaignId) await db.campaign.delete({ where: { id: campaignId } });
+    if (dailyUsageIds.length)
+      await db.smsDailyUsage.deleteMany({
+        where: { id: { in: dailyUsageIds }, entries: { none: {} } },
+      });
+    if (contactIds.length)
+      await db.contact.deleteMany({ where: { id: { in: contactIds } } });
+    if (propertyIds.length)
+      await db.property.deleteMany({ where: { id: { in: propertyIds } } });
+    if (templateId) await db.smsTemplate.delete({ where: { id: templateId } });
+    if (adminId) await db.user.delete({ where: { id: adminId } });
+  } finally {
+    await db.$disconnect();
+  }
 });
 
-describe("PostgreSQL application integration", () => {
-  it("enforces the normalized phone uniqueness constraint", async () => {
-    await expect(
-      db.contact.create({ data: { normalizedPhone: phones[0] } }),
-    ).rejects.toMatchObject({ code: "P2002" });
-  });
-
-  it("returns not-found, a normalized unique match, and multi-property ambiguity through the lookup endpoint", async () => {
-    const missing = await callbackLookupEndpoint(
-      new Request(
-        "http://localhost/api/integrations/callback-lookup?phone=2025550999",
-        { headers: integrationHeaders },
-      ),
-    );
-    expect(await missing.json()).toMatchObject({
-      match_status: "not_found",
-      phone: "+12025550999",
+describe("SMS-first PostgreSQL application integration", () => {
+  it("persists the approved template, campaign, consent, sequence, and message graph", async () => {
+    const fixture = await createSmsFixture("schema-graph");
+    const graph = await db.campaignContact.findUniqueOrThrow({
+      where: { id: fixture.campaignContactId },
+      include: {
+        campaign: {
+          include: {
+            smsTemplateVersion: { include: { template: true } },
+          },
+        },
+        contact: true,
+        property: true,
+        outreachSequence: true,
+        consentEvidence: true,
+        outboundMessages: {
+          include: { templateVersion: true, consentEvidence: true },
+        },
+      },
     });
 
-    const unique = await callbackLookupEndpoint(
-      new Request(
-        "http://localhost/api/integrations/callback-lookup?phone=(202)%20555-0103",
-        { headers: integrationHeaders },
-      ),
-    );
-    expect(await unique.json()).toMatchObject({
-      match_status: "matched",
-      campaign_contact_id: campaignContactIds[4],
+    expect(graph).toMatchObject({
+      id: fixture.campaignContactId,
+      selectedForSend: true,
+      contact: { normalizedPhone: fixture.phone },
+      property: { county: "Fairfax", state: "VA" },
+      campaign: {
+        kind: "SMS",
+        smsComplianceStatus: "APPROVED",
+        smsTemplateVersion: {
+          id: templateVersionId,
+          status: "APPROVED",
+          contentHash: sha256(templateBody),
+          template: { id: templateId, active: true },
+        },
+      },
+      outreachSequence: {
+        currentState: "SMS_QUEUED",
+        smsToColdCallDelayHours: 48,
+      },
     });
-
-    const ambiguous = await callbackLookupEndpoint(
-      new Request(
-        "http://localhost/api/integrations/callback-lookup?phone=202.555.0101",
-        { headers: integrationHeaders },
-      ),
-    );
-    const ambiguousBody = await ambiguous.json();
-    expect(ambiguousBody).toMatchObject({ match_status: "ambiguous" });
-    expect(ambiguousBody.candidates).toHaveLength(2);
+    expect(graph.consentEvidence).toHaveLength(1);
+    expect(graph.outboundMessages).toHaveLength(1);
+    expect(graph.outboundMessages[0]).toMatchObject({
+      templateVersionId,
+      consentEvidenceId: fixture.consentId,
+      toPhone: fixture.phone,
+      fromPhone: senderPhone,
+      status: "QUEUED",
+    });
   });
 
-  it("stops every matching sequence when callback attribution is ambiguous and remains idempotent", async () => {
-    const payload = {
-      idempotency_key: `${prefix}-callback`,
-      phone: phones[0],
-      outcome: "opt_out" as const,
+  it("persists a dry-run result once without attempts, usage, or a cold-call timer", async () => {
+    const fixture = await createSmsFixture("dry-run");
+    const provider = new DryRunSMSProvider();
+    const request = {
+      idempotencyKey: `${prefix}:dry-run:provider-call`,
+      to: fixture.phone,
+      from: senderPhone,
+      body: "Integration dry-run body",
+      clientReference: fixture.messageId,
     };
-    const ambiguous = await callbackResultEndpoint(
-      new Request("http://localhost/api/integrations/callback-result", {
-        method: "POST",
-        headers: integrationHeaders,
-        body: JSON.stringify(payload),
-      }),
-    );
-    expect(ambiguous.status).toBe(200);
-    expect(await ambiguous.json()).toMatchObject({
-      ok: true,
-      duplicate: false,
+    const firstProviderResult = await provider.send(request);
+    const replayedProviderResult = await provider.send(request);
+    expect(replayedProviderResult).toMatchObject({
+      providerMessageId: firstProviderResult.providerMessageId,
+      requestFingerprint: firstProviderResult.requestFingerprint,
     });
-    const replay = () =>
-      callbackResultEndpoint(
-        new Request("http://localhost/api/integrations/callback-result", {
-          method: "POST",
-          headers: integrationHeaders,
-          body: JSON.stringify(payload),
-        }),
-      );
-    expect(await (await replay()).json()).toMatchObject({
-      ok: true,
-      duplicate: true,
+
+    const firstPersistence = await persistDryRunSmsResult({
+      messageId: fixture.messageId,
+      providerMessageId: firstProviderResult.providerMessageId,
+      rawResponse: firstProviderResult.rawResponse,
+      requestFingerprint: firstProviderResult.requestFingerprint,
+      occurredAt: new Date("2030-01-02T15:00:00.000Z"),
     });
-    const conflict = await callbackResultEndpoint(
-      new Request("http://localhost/api/integrations/callback-result", {
-        method: "POST",
-        headers: integrationHeaders,
-        body: JSON.stringify({
-          ...payload,
-          campaign_contact_id: campaignContactIds[0],
-        }),
-      }),
-    );
-    expect(conflict.status).toBe(400);
-    expect(await conflict.json()).toMatchObject({
-      error: expect.stringMatching(/idempotency key/i),
+    const replayedPersistence = await persistDryRunSmsResult({
+      messageId: fixture.messageId,
+      providerMessageId: firstProviderResult.providerMessageId,
+      rawResponse: firstProviderResult.rawResponse,
+      requestFingerprint: firstProviderResult.requestFingerprint,
+      occurredAt: new Date("2030-01-02T15:01:00.000Z"),
+    });
+
+    expect(firstPersistence).toEqual({
+      updated: true,
+      reason: "recorded",
+      messageStatus: "DRY_RUN",
+    });
+    expect(replayedPersistence).toEqual({
+      updated: false,
+      reason: "already_recorded",
+      messageStatus: "DRY_RUN",
     });
     expect(
-      await db.callbackOutcome.count({
-        where: { idempotencyKey: payload.idempotency_key },
+      await db.smsOutboundMessage.findUnique({
+        where: { id: fixture.messageId },
+      }),
+    ).toMatchObject({
+      status: "DRY_RUN",
+      providerKey: "dry-run",
+      actualCostMicros: 0,
+      acceptedAt: null,
+      sentAt: null,
+    });
+    expect(
+      await db.outreachSequence.findUnique({
+        where: { id: fixture.sequenceId },
+      }),
+    ).toMatchObject({
+      currentState: "SMS_DRY_RUN",
+      smsSentAt: null,
+      coldCallDueAt: null,
+      coldCallEligibleAt: null,
+      nextEligibleAt: null,
+    });
+    expect(
+      await db.smsOutboundAttempt.count({
+        where: { messageId: fixture.messageId },
+      }),
+    ).toBe(0);
+    expect(
+      await db.smsUsageLedger.count({
+        where: { messageId: fixture.messageId },
+      }),
+    ).toBe(0);
+    expect(
+      await db.smsAuditEvent.count({
+        where: {
+          entityId: fixture.messageId,
+          eventType: "SMS_DRY_RUN",
+        },
+      }),
+    ).toBe(1);
+  });
+
+  it("recovers a synchronous provider delivery after a worker interruption without resending", async () => {
+    const occurredAt = new Date("2030-01-03T15:00:00.000Z");
+    const fixture = await createSmsFixture("synchronous-result-recovery", {
+      anchor: occurredAt,
+    });
+    await db.$transaction([
+      db.smsOutboundMessage.update({
+        where: { id: fixture.messageId },
+        data: {
+          providerKey,
+          status: "SUBMITTING",
+          submissionStartedAt: occurredAt,
+        },
+      }),
+      db.campaignContact.update({
+        where: { id: fixture.campaignContactId },
+        data: { status: "SENDING" },
+      }),
+      db.outreachSequence.update({
+        where: { id: fixture.sequenceId },
+        data: { currentState: "SMS_SENDING" },
+      }),
+    ]);
+    const attempt = await db.smsOutboundAttempt.create({
+      data: {
+        messageId: fixture.messageId,
+        attemptNumber: 1,
+        idempotencyKey: `${prefix}:synchronous-result-recovery:attempt`,
+        providerKey,
+        status: "STARTED",
+        startedAt: occurredAt,
+      },
+    });
+    const providerMessageId = `${prefix}-synchronous-provider-message`;
+    await persistLiveSmsProviderResult({
+      messageId: fixture.messageId,
+      attemptId: attempt.id,
+      providerKey,
+      outcome: "ACCEPTED",
+      providerMessageId,
+      providerStatus: "delivered",
+      providerResponse: { status: "delivered", synchronous: true },
+      occurredAt,
+    });
+
+    const recovered = await reconcileSynchronousSmsProviderResults();
+    expect(recovered.recovered).toBeGreaterThanOrEqual(1);
+    expect(
+      await db.smsOutboundMessage.findUnique({
+        where: { id: fixture.messageId },
+      }),
+    ).toMatchObject({
+      status: "DELIVERED",
+      providerMessageId,
+      sentAt: occurredAt,
+      deliveredAt: occurredAt,
+    });
+    expect(
+      await db.outreachSequence.findUnique({
+        where: { id: fixture.sequenceId },
+      }),
+    ).toMatchObject({
+      currentState: "SMS_DELIVERED",
+      smsSentAt: occurredAt,
+      coldCallDueAt: addHours(occurredAt, 48),
+    });
+    expect(
+      await db.smsOutboundAttempt.count({
+        where: { messageId: fixture.messageId },
+      }),
+    ).toBe(1);
+  });
+
+  it("makes an unanswered sent SMS cold-call eligible at exactly 48 hours", async () => {
+    const sentAt = new Date("2030-01-03T15:00:00.000Z");
+    const dueAt = addHours(sentAt, 48);
+    const fixture = await createSmsFixture("forty-eight-hours", {
+      anchor: sentAt,
+      messageStatus: "SENT",
+      campaignContactStatus: "SENT",
+      sequenceState: "SMS_SENT",
+      providerMessageId: `${prefix}-forty-eight-hours-message`,
+      acceptedAt: sentAt,
+      sentAt,
+      smsSentAt: sentAt,
+      coldCallDueAt: dueAt,
+    });
+
+    await reconcileSmsOutreach(new Date(dueAt.getTime() - 1));
+    expect(
+      await db.outreachSequence.findUnique({
+        where: { id: fixture.sequenceId },
+      }),
+    ).toMatchObject({
+      currentState: "SMS_SENT",
+      coldCallDueAt: dueAt,
+      coldCallEligibleAt: null,
+    });
+
+    await reconcileSmsOutreach(dueAt);
+    expect(
+      await db.outreachSequence.findUnique({
+        where: { id: fixture.sequenceId },
+      }),
+    ).toMatchObject({
+      currentState: "COLD_CALL_ELIGIBLE",
+      coldCallDueAt: dueAt,
+      coldCallEligibleAt: dueAt,
+      nextEligibleAt: null,
+    });
+    expect(
+      await db.outreachEvent.count({
+        where: {
+          sequenceId: fixture.sequenceId,
+          type: "COLD_CALL_ELIGIBLE",
+        },
+      }),
+    ).toBe(1);
+  });
+
+  it("matches an inbound reply to the newest reciprocal outbound and deduplicates provider delivery", async () => {
+    const sentAt = new Date("2030-01-06T15:00:00.000Z");
+    const fixture = await createSmsFixture("inbound-reply", {
+      anchor: sentAt,
+      messageStatus: "SENT",
+      campaignContactStatus: "SENT",
+      sequenceState: "SMS_SENT",
+      providerMessageId: `${prefix}-inbound-outbound`,
+      acceptedAt: sentAt,
+      sentAt,
+      smsSentAt: sentAt,
+      coldCallDueAt: addHours(sentAt, 48),
+    });
+    const input = {
+      providerKey: ` ${providerKey.toUpperCase()} `,
+      providerMessageId: ` ${prefix}-inbound-provider-message `,
+      providerConversationId: `${prefix}-conversation`,
+      from: fixture.phone,
+      to: senderPhone,
+      body: "Yes, I am interested.",
+      receivedAt: addHours(sentAt, 1),
+      rawPayload: {
+        id: `${prefix}-inbound-provider-message`,
+        nested: { preserved: true },
+      },
+    };
+
+    const first = await recordSmsInboundMessage(input);
+    const replay = await recordSmsInboundMessage(input);
+
+    expect(first).toMatchObject({
+      matchedOutboundMessageId: fixture.messageId,
+      duplicate: false,
+      classification: "UNCLASSIFIED",
+    });
+    expect(replay).toMatchObject({
+      messageId: first.messageId,
+      conversationId: first.conversationId,
+      matchedOutboundMessageId: fixture.messageId,
+      duplicate: true,
+    });
+    expect(
+      await db.smsInboundMessage.count({
+        where: {
+          providerKey,
+          providerMessageId: `${prefix}-inbound-provider-message`,
+        },
       }),
     ).toBe(1);
     expect(
+      await db.smsInboundMessage.findUnique({ where: { id: first.messageId } }),
+    ).toMatchObject({
+      campaignContactId: fixture.campaignContactId,
+      inReplyToMessageId: fixture.messageId,
+      rawPayload: input.rawPayload,
+    });
+    expect(
+      await db.smsConversation.findUnique({
+        where: { campaignContactId: fixture.campaignContactId },
+      }),
+    ).toMatchObject({
+      id: first.conversationId,
+      providerKey,
+      providerConversationId: `${prefix}-conversation`,
+      status: "OPEN",
+    });
+    expect(
+      await db.smsOutboundMessage.findUnique({
+        where: { id: fixture.messageId },
+      }),
+    ).toMatchObject({ status: "REPLIED", repliedAt: input.receivedAt });
+    expect(
+      await db.outreachSequence.findUnique({
+        where: { id: fixture.sequenceId },
+      }),
+    ).toMatchObject({
+      currentState: "SMS_REPLIED",
+      smsRespondedAt: input.receivedAt,
+      coldCallDueAt: null,
+      coldCallEligibleAt: null,
+      nextEligibleAt: null,
+    });
+    expect(
+      await db.campaignSuppression.findUnique({
+        where: {
+          campaignId_normalizedPhone: {
+            campaignId,
+            normalizedPhone: fixture.phone,
+          },
+        },
+      }),
+    ).toMatchObject({ reason: "COMPLIANCE" });
+  });
+
+  it("applies STOP as a global suppression and blocks every sequence for the phone", async () => {
+    const sentAt = new Date("2030-01-07T15:00:00.000Z");
+    const primary = await createSmsFixture("stop-primary", {
+      anchor: sentAt,
+      messageStatus: "DELIVERED",
+      campaignContactStatus: "DELIVERED",
+      sequenceState: "SMS_DELIVERED",
+      providerMessageId: `${prefix}-stop-outbound`,
+      acceptedAt: sentAt,
+      sentAt,
+      deliveredAt: addHours(sentAt, 1),
+      smsSentAt: sentAt,
+      coldCallDueAt: addHours(sentAt, 48),
+    });
+    const sibling = await createSmsFixture("stop-sibling", {
+      anchor: sentAt,
+      contact: { id: primary.contactId, phone: primary.phone },
+      messageStatus: "SCHEDULED",
+      campaignContactStatus: "QUEUED",
+      sequenceState: "SMS_SCHEDULED",
+      smsSentAt: null,
+      coldCallDueAt: addHours(sentAt, 72),
+    });
+
+    const result = await recordSmsInboundMessage({
+      providerKey,
+      providerMessageId: `${prefix}-stop-inbound`,
+      from: primary.phone,
+      to: senderPhone,
+      body: "STOP",
+      receivedAt: addHours(sentAt, 2),
+      rawPayload: { command: "STOP" },
+    });
+
+    expect(result).toMatchObject({
+      matchedOutboundMessageId: primary.messageId,
+      duplicate: false,
+      classification: "OPT_OUT",
+    });
+    expect(
       await db.suppressionEntry.findUnique({
-        where: { normalizedPhone: phones[0] },
+        where: { normalizedPhone: primary.phone },
+      }),
+    ).toMatchObject({ reason: "OPT_OUT", contactId: primary.contactId });
+    expect(
+      await db.campaignSuppression.findUnique({
+        where: {
+          campaignId_normalizedPhone: {
+            campaignId,
+            normalizedPhone: primary.phone,
+          },
+        },
       }),
     ).toMatchObject({ reason: "OPT_OUT" });
     expect(
       await db.outreachSequence.count({
         where: {
+          campaignContactId: {
+            in: [primary.campaignContactId, sibling.campaignContactId],
+          },
           currentState: "OPT_OUT",
-          campaignContact: { contact: { normalizedPhone: phones[0] } },
+          terminalReason: "OPT_OUT",
+          coldCallDueAt: null,
+          coldCallEligibleAt: null,
+          nextEligibleAt: null,
         },
       }),
-    ).toBe(3);
-  });
-
-  it("records normalized qualified-lead and not-interested callback outcomes with unique attribution", async () => {
-    const qualified = await callbackResultEndpoint(
-      new Request("http://localhost/api/integrations/callback-result", {
-        method: "POST",
-        headers: integrationHeaders,
-        body: JSON.stringify({
-          idempotency_key: `${prefix}-qualified`,
-          phone: "(202) 555-0103",
-          outcome: "qualified_lead",
-        }),
-      }),
-    );
-    expect(qualified.status).toBe(200);
+    ).toBe(2);
     expect(
-      await db.callbackOutcome.findUnique({
-        where: { idempotencyKey: `${prefix}-qualified` },
+      await db.smsOutboundMessage.findUnique({
+        where: { id: primary.messageId },
       }),
-    ).toMatchObject({
-      normalizedPhone: phones[2],
-      outcome: "QUALIFIED_LEAD",
-      campaignId,
-      campaignContactId: campaignContactIds[4],
-    });
-
-    await callbackResultEndpoint(
-      new Request("http://localhost/api/integrations/callback-result", {
-        method: "POST",
-        headers: integrationHeaders,
-        body: JSON.stringify({
-          idempotency_key: `${prefix}-not-interested`,
-          phone: "2025550103",
-          outcome: "not_interested",
-          campaign_contact_id: campaignContactIds[4],
-        }),
-      }),
-    );
+    ).toMatchObject({ status: "REPLIED" });
     expect(
-      await db.callbackOutcome.findUnique({
-        where: { idempotencyKey: `${prefix}-not-interested` },
+      await db.smsOutboundMessage.findUnique({
+        where: { id: sibling.messageId },
       }),
-    ).toMatchObject({ outcome: "NOT_INTERESTED" });
-  });
-
-  it("maps official success/failure payloads, deduplicates webhooks, and persists provider DNC", async () => {
-    const success = {
-      drop_id: `${prefix}-provider-drop`,
-      foreign_id: dropIds[2],
-      phone_number: phones[0],
-      attempt_date: new Date().toISOString(),
-      status: "success",
-      dnc: false,
-    };
-    expect((await processDropCowboyWebhook(success)).duplicate).toBe(false);
-    expect((await processDropCowboyWebhook(success)).duplicate).toBe(true);
+    ).toMatchObject({ status: "SUPPRESSED", errorCode: "OPT_OUT" });
+    await reconcileSmsOutreach(addHours(sentAt, 240));
     expect(
-      await db.drop.findUnique({ where: { id: dropIds[2] } }),
-    ).toMatchObject({ status: "DELIVERED" });
-
-    const dnc = {
-      drop_id: `${prefix}-provider-dnc`,
-      foreign_id: dropIds[3],
-      phone_number: phones[1],
-      attempt_date: new Date().toISOString(),
-      status: "failure",
-      reason: "Internal DNC",
-      dnc: true,
-    };
-    await processDropCowboyWebhook(dnc);
-    expect(
-      await db.drop.findUnique({ where: { id: dropIds[3] } }),
-    ).toMatchObject({ status: "OPTED_OUT" });
-    expect(
-      await db.suppressionEntry.findUnique({
-        where: { normalizedPhone: phones[1] },
-      }),
-    ).toMatchObject({ reason: "PROVIDER_DNC" });
-  });
-
-  it("calculates campaign response, lead, expected-deal, and VA-equivalent metrics from PostgreSQL", async () => {
-    const metrics = await getCampaignMetrics(campaignId);
-    expect(metrics).toMatchObject({
-      callbacks: 1,
-      interested: 1,
-      qualified: 1,
-      expectedDeals: 1 / 15,
-      vaEquivalentConversations: 40,
-    });
-    expect(metrics.costPerExpectedDealCents).toBeGreaterThan(0);
-  });
-});
-
-let outreachFixtureCounter = 100;
-
-async function createOutreachFixture(label: string, anchor: Date) {
-  outreachFixtureCounter += 1;
-  const line = String(1000 + outreachFixtureCounter).slice(-4);
-  const phone = `+1202555${line}`;
-  const source = `${prefix}-${label}`;
-  const contact = await db.contact.create({
-    data: { normalizedPhone: phone, firstName: label, source },
-  });
-  contactIds.push(contact.id);
-  const property = await db.property.create({
-    data: {
-      propertyAddress: `${outreachFixtureCounter} Sequence Way`,
-      city: "Testville",
-      state: "VA",
-      postalCode: "22101",
-      source,
-    },
-  });
-  propertyIds.push(property.id);
-  const campaignContact = await db.campaignContact.create({
-    data: {
-      campaignId,
-      contactId: contact.id,
-      propertyId: property.id,
-      status: "QUEUED",
-      selectedForSend: true,
-    },
-  });
-  campaignContactIds.push(campaignContact.id);
-  const template = await db.scriptTemplateVersion.findFirstOrThrow({
-    where: { template: { name: `${prefix}-template` } },
-  });
-  const voice = await db.voiceConfiguration.findUniqueOrThrow({
-    where: { name: `${prefix}-voice` },
-  });
-  const audio = await db.audioAsset.create({
-    data: {
-      campaignContactId: campaignContact.id,
-      scriptTemplateVersionId: template.id,
-      voiceConfigurationId: voice.id,
-      renderedText: `Hello ${label}`,
-      textHash: `${prefix}-${label}-${outreachFixtureCounter}`,
-      voiceId: voice.voiceId,
-      modelId: voice.modelId,
-      characterCount: 10,
-      objectKey: `${prefix}/${label}.mp3`,
-      contentType: "audio/mpeg",
-      status: "READY",
-      billingDisposition: "DRY_RUN",
-      generatedAt: anchor,
-    },
-  });
-  const drop = await db.drop.create({
-    data: {
-      campaignContactId: campaignContact.id,
-      audioAssetId: audio.id,
-      status: "QUEUED",
-      queuedAt: anchor,
-    },
-  });
-  dropIds.push(drop.id);
-  await ensureOutreachSequence(campaignContact.id, anchor);
-  await db.$transaction((tx) =>
-    recordRvmSentTx(tx, {
-      campaignContactId: campaignContact.id,
-      occurredAt: anchor,
-      idempotencyKey: `${prefix}:${label}:rvm-sent`,
-    }),
-  );
-  return {
-    phone,
-    source,
-    contactId: contact.id,
-    campaignContactId: campaignContact.id,
-    sequenceId: (
-      await db.outreachSequence.findUniqueOrThrow({
-        where: { campaignContactId: campaignContact.id },
-      })
-    ).id,
-    dropId: drop.id,
-  };
-}
-
-async function advanceFixtureToSmsEligibility(
-  fixture: Awaited<ReturnType<typeof createOutreachFixture>>,
-  anchor: Date,
-  label: string,
-) {
-  await processDropCowboyWebhook({
-    drop_id: `${prefix}-${label}-provider`,
-    foreign_id: fixture.dropId,
-    phone_number: fixture.phone,
-    attempt_date: anchor.toISOString(),
-    status: "success",
-    dnc: false,
-  });
-  await reconcileDueOutreach(new Date(anchor.getTime() + 24 * 60 * 60 * 1000));
-}
-
-async function exportFixtureForSms(
-  fixture: Awaited<ReturnType<typeof createOutreachFixture>>,
-  label: string,
-) {
-  return createOutreachExport({
-    type: "SMS_ELIGIBILITY",
-    campaignId,
-    source: fixture.source,
-    idempotencyKey: `${prefix}-${label}-sms-export`,
-    user: { id: adminId, role: "ADMIN" },
-  });
-}
-
-describe("durable outreach orchestration", () => {
-  it("materializes RVM to SMS eligibility at 24 hours after a fresh reconciler start", async () => {
-    const anchor = new Date("2026-09-20T14:00:00.000Z");
-    const fixture = await createOutreachFixture("restart", anchor);
-    await processDropCowboyWebhook({
-      drop_id: `${prefix}-restart-provider`,
-      foreign_id: fixture.dropId,
-      phone_number: fixture.phone,
-      attempt_date: anchor.toISOString(),
-      status: "success",
-      dnc: false,
-    });
-    const due = new Date(anchor.getTime() + 24 * 60 * 60 * 1000);
-    await reconcileDueOutreach(new Date(due.getTime() - 1));
-    expect(
-      await db.outreachSequence.findUnique({
-        where: { id: fixture.sequenceId },
-      }),
-    ).toMatchObject({
-      currentState: "SMS_NOT_YET_ELIGIBLE",
-      nextEligibleAt: due,
-    });
-    const restartedReconciler = await reconcileDueOutreach(due);
-    expect(restartedReconciler.smsEligible).toBeGreaterThanOrEqual(1);
-    expect(
-      await db.outreachSequence.findUnique({
-        where: { id: fixture.sequenceId },
-      }),
-    ).toMatchObject({ currentState: "SMS_ELIGIBLE", nextEligibleAt: null });
-  });
-
-  it("prevents SMS after a callback or qualified lead and preserves RVM attribution", async () => {
-    const anchor = new Date("2026-09-21T14:00:00.000Z");
-    const callbackFixture = await createOutreachFixture(
-      "callback-stop",
-      anchor,
-    );
-    await processDropCowboyWebhook({
-      drop_id: `${prefix}-callback-stop-provider`,
-      foreign_id: callbackFixture.dropId,
-      phone_number: callbackFixture.phone,
-      attempt_date: anchor.toISOString(),
-      status: "success",
-      dnc: false,
-    });
-    await callbackResultEndpoint(
-      new Request("http://localhost/api/integrations/callback-result", {
-        method: "POST",
-        headers: integrationHeaders,
-        body: JSON.stringify({
-          idempotency_key: `${prefix}-callback-stop-result`,
-          phone: callbackFixture.phone,
-          outcome: "callback",
-          campaign_contact_id: callbackFixture.campaignContactId,
-        }),
-      }),
-    );
-    await reconcileDueOutreach(
-      new Date(anchor.getTime() + 30 * 60 * 60 * 1000),
-    );
-    expect(
-      await db.outreachSequence.findUnique({
-        where: { id: callbackFixture.sequenceId },
-      }),
-    ).toMatchObject({ currentState: "RVM_CALLBACK", nextEligibleAt: null });
-
-    const leadFixture = await createOutreachFixture("qualified-stop", anchor);
-    await callbackResultEndpoint(
-      new Request("http://localhost/api/integrations/callback-result", {
-        method: "POST",
-        headers: integrationHeaders,
-        body: JSON.stringify({
-          idempotency_key: `${prefix}-qualified-stop-result`,
-          phone: leadFixture.phone,
-          outcome: "qualified_lead",
-          campaign_contact_id: leadFixture.campaignContactId,
-        }),
-      }),
-    );
-    expect(
-      await db.outreachSequence.findUnique({
-        where: { id: leadFixture.sequenceId },
-      }),
-    ).toMatchObject({ currentState: "QUALIFIED_LEAD", nextEligibleAt: null });
-    expect(
-      await db.leadAttribution.findUnique({
-        where: { campaignContactId: leadFixture.campaignContactId },
-      }),
-    ).toMatchObject({ creditedChannel: "RVM_CALLBACK" });
-  });
-
-  it("prevents cold-call eligibility after an SMS reply", async () => {
-    const anchor = new Date("2026-09-22T14:00:00.000Z");
-    const fixture = await createOutreachFixture("sms-reply", anchor);
-    await advanceFixtureToSmsEligibility(fixture, anchor, "sms-reply");
-    await exportFixtureForSms(fixture, "sms-reply");
-    const sentAt = new Date(anchor.getTime() + 25 * 60 * 60 * 1000);
-    await db.$transaction(async (tx) => {
-      await recordExternalOutcomeTx(tx, {
-        sequenceId: fixture.sequenceId,
-        channel: "SMS",
-        result: "sent",
-        occurredAt: sentAt,
-        idempotencyKey: `${prefix}:sms-reply:sent`,
-      });
-      await recordExternalOutcomeTx(tx, {
-        sequenceId: fixture.sequenceId,
-        channel: "SMS",
-        result: "reply",
-        occurredAt: new Date(sentAt.getTime() + 60 * 60 * 1000),
-        idempotencyKey: `${prefix}:sms-reply:reply`,
-      });
-    });
-    await reconcileDueOutreach(
-      new Date(sentAt.getTime() + 72 * 60 * 60 * 1000),
-    );
-    expect(
-      await db.outreachSequence.findUnique({
-        where: { id: fixture.sequenceId },
-      }),
-    ).toMatchObject({ currentState: "SMS_REPLIED", nextEligibleAt: null });
-  });
-
-  it("advances SMS no-response at 48 hours and blocks duplicate SMS and BatchDialer exports", async () => {
-    const anchor = new Date("2026-09-23T14:00:00.000Z");
-    const fixture = await createOutreachFixture("export-guard", anchor);
-    await advanceFixtureToSmsEligibility(fixture, anchor, "export-guard");
-    const user = { id: adminId, role: "ADMIN" as const };
-    const smsExport = await createOutreachExport({
-      type: "SMS_ELIGIBILITY",
-      campaignId,
-      source: fixture.source,
-      idempotencyKey: `${prefix}-sms-export-1`,
-      user,
-    });
-    expect(smsExport.itemCount).toBe(1);
-    await expect(
-      createOutreachExport({
-        type: "SMS_ELIGIBILITY",
-        campaignId,
-        source: fixture.source,
-        idempotencyKey: `${prefix}-sms-export-2`,
-        user,
-      }),
-    ).rejects.toThrow(/eligible|already exported/i);
-    const repeat = await createOutreachExport({
-      type: "SMS_ELIGIBILITY",
-      campaignId,
-      source: fixture.source,
-      idempotencyKey: `${prefix}-sms-export-repeat`,
-      intentionalRepeat: true,
-      repeatReason: "Controlled integration-test repeat",
-      confirmation: "RE-EXPORT",
-      user,
-    });
-    expect(repeat.intentionalRepeat).toBe(true);
-
-    const sentAt = new Date(anchor.getTime() + 25 * 60 * 60 * 1000);
-    await db.$transaction((tx) =>
-      recordExternalOutcomeTx(tx, {
-        sequenceId: fixture.sequenceId,
-        channel: "SMS",
-        result: "sent",
-        occurredAt: sentAt,
-        idempotencyKey: `${prefix}:export-guard:sent`,
-      }),
-    );
-    const coldDue = new Date(sentAt.getTime() + 48 * 60 * 60 * 1000);
-    await reconcileDueOutreach(new Date(coldDue.getTime() - 1));
-    expect(
-      await db.outreachSequence.findUnique({
-        where: { id: fixture.sequenceId },
-      }),
-    ).toMatchObject({ currentState: "SMS_SENT_EXTERNAL" });
-    await reconcileDueOutreach(coldDue);
-    expect(
-      await db.outreachSequence.findUnique({
-        where: { id: fixture.sequenceId },
-      }),
-    ).toMatchObject({ currentState: "COLD_CALL_ELIGIBLE" });
-
-    const batchExport = await createOutreachExport({
-      type: "BATCH_DIALER",
-      campaignId,
-      source: fixture.source,
-      idempotencyKey: `${prefix}-batch-export-1`,
-      user,
-    });
-    expect(batchExport.itemCount).toBe(1);
-    await expect(
-      createOutreachExport({
-        type: "BATCH_DIALER",
-        campaignId,
-        source: fixture.source,
-        idempotencyKey: `${prefix}-batch-export-2`,
-        user,
-      }),
-    ).rejects.toThrow(/eligible|already exported/i);
-  });
-
-  it("records the creating touch as SMS without changing it later", async () => {
-    const anchor = new Date("2026-09-24T14:00:00.000Z");
-    const fixture = await createOutreachFixture("sms-attribution", anchor);
-    await advanceFixtureToSmsEligibility(fixture, anchor, "sms-attribution");
-    await exportFixtureForSms(fixture, "sms-attribution");
-    const sentAt = new Date(anchor.getTime() + 25 * 60 * 60 * 1000);
-    await db.$transaction((tx) =>
-      recordExternalOutcomeTx(tx, {
-        sequenceId: fixture.sequenceId,
-        channel: "SMS",
-        result: "sent",
-        occurredAt: sentAt,
-        idempotencyKey: `${prefix}:sms-attribution:sent`,
-      }),
-    );
-    await db.$transaction((tx) =>
-      recordExternalOutcomeTx(tx, {
-        sequenceId: fixture.sequenceId,
-        channel: "SMS",
-        result: "qualified lead",
-        occurredAt: new Date(anchor.getTime() + 26 * 60 * 60 * 1000),
-        idempotencyKey: `${prefix}:sms-attribution:qualified`,
-      }),
-    );
-    expect(
-      await db.leadAttribution.findUnique({
-        where: { campaignContactId: fixture.campaignContactId },
-      }),
-    ).toMatchObject({ creditedChannel: "SMS" });
-    await db.$transaction((tx) =>
-      recordExternalOutcomeTx(tx, {
-        sequenceId: fixture.sequenceId,
-        channel: "SMS",
-        result: "closed",
-        occurredAt: new Date(anchor.getTime() + 27 * 60 * 60 * 1000),
-        idempotencyKey: `${prefix}:sms-attribution:closed`,
-      }),
-    );
-    expect(
-      await db.leadAttribution.findUnique({
-        where: { campaignContactId: fixture.campaignContactId },
-      }),
-    ).toMatchObject({ creditedChannel: "SMS" });
-  });
-
-  it("keeps a failed SMS out of cold-call eligibility and rejects skipped stages", async () => {
-    const anchor = new Date("2026-09-25T14:00:00.000Z");
-    const fixture = await createOutreachFixture("sms-failure", anchor);
-
-    await expect(
-      db.$transaction((tx) =>
-        recordExternalOutcomeTx(tx, {
-          sequenceId: fixture.sequenceId,
-          channel: "SMS",
-          result: "sent",
-          occurredAt: new Date(anchor.getTime() + 60 * 60 * 1000),
-          idempotencyKey: `${prefix}:sms-failure:invalid-sent`,
-        }),
-      ),
-    ).rejects.toThrow(/successful RVM|exported for external SMS/i);
-
-    await advanceFixtureToSmsEligibility(fixture, anchor, "sms-failure");
-    await exportFixtureForSms(fixture, "sms-failure");
-    const failedAt = new Date(anchor.getTime() + 25 * 60 * 60 * 1000);
-    await db.$transaction((tx) =>
-      recordExternalOutcomeTx(tx, {
-        sequenceId: fixture.sequenceId,
-        channel: "SMS",
-        result: "failed",
-        occurredAt: failedAt,
-        idempotencyKey: `${prefix}:sms-failure:failed`,
-      }),
-    );
-    await reconcileDueOutreach(
-      new Date(failedAt.getTime() + 96 * 60 * 60 * 1000),
-    );
-    expect(
-      await db.outreachSequence.findUnique({
-        where: { id: fixture.sequenceId },
-      }),
-    ).toMatchObject({
-      currentState: "SMS_FAILED",
-      smsSentAt: null,
-      coldCallEligibleAt: null,
-      nextEligibleAt: null,
-    });
-  });
-
-  it("records late RVM webhooks without regressing the first final result", async () => {
-    const deliveredAt = new Date("2026-09-26T14:00:00.000Z");
-    const deliveredFixture = await createOutreachFixture(
-      "ordered-delivery",
-      deliveredAt,
-    );
-    await processDropCowboyWebhook({
-      drop_id: `${prefix}-ordered-delivered`,
-      foreign_id: deliveredFixture.dropId,
-      phone_number: deliveredFixture.phone,
-      attempt_date: deliveredAt.toISOString(),
-      status: "success",
-      dnc: false,
-    });
-    await processDropCowboyWebhook({
-      drop_id: `${prefix}-ordered-late-sent`,
-      foreign_id: deliveredFixture.dropId,
-      phone_number: deliveredFixture.phone,
-      attempt_date: new Date(deliveredAt.getTime() - 60_000).toISOString(),
-      status: "sent",
-      dnc: false,
-    });
-    await processDropCowboyWebhook({
-      drop_id: `${prefix}-ordered-late-failure`,
-      foreign_id: deliveredFixture.dropId,
-      phone_number: deliveredFixture.phone,
-      attempt_date: new Date(deliveredAt.getTime() + 60_000).toISOString(),
-      status: "failure",
-      dnc: false,
-    });
-    expect(
-      await db.drop.findUnique({ where: { id: deliveredFixture.dropId } }),
-    ).toMatchObject({ status: "DELIVERED", deliveredAt });
-    expect(
-      await db.outreachSequence.findUnique({
-        where: { id: deliveredFixture.sequenceId },
-      }),
-    ).toMatchObject({ currentState: "SMS_NOT_YET_ELIGIBLE" });
-    expect(
-      await db.rvmUsageLedger.count({
-        where: { dropId: deliveredFixture.dropId, kind: "SUCCESS" },
-      }),
-    ).toBe(1);
-
-    const failedAt = new Date("2026-09-27T14:00:00.000Z");
-    const failedFixture = await createOutreachFixture(
-      "ordered-failure",
-      failedAt,
-    );
-    await processDropCowboyWebhook({
-      drop_id: `${prefix}-ordered-failed`,
-      foreign_id: failedFixture.dropId,
-      phone_number: failedFixture.phone,
-      attempt_date: failedAt.toISOString(),
-      status: "failure",
-      dnc: false,
-    });
-    await processDropCowboyWebhook({
-      drop_id: `${prefix}-ordered-late-delivery`,
-      foreign_id: failedFixture.dropId,
-      phone_number: failedFixture.phone,
-      attempt_date: new Date(failedAt.getTime() + 60_000).toISOString(),
-      status: "success",
-      dnc: false,
-    });
-    expect(
-      await db.drop.findUnique({ where: { id: failedFixture.dropId } }),
-    ).toMatchObject({ status: "FAILED", failedAt });
-    expect(
-      await db.outreachSequence.findUnique({
-        where: { id: failedFixture.sequenceId },
-      }),
-    ).toMatchObject({ currentState: "RVM_FAILED" });
-    expect(
-      await db.rvmUsageLedger.count({
-        where: { dropId: failedFixture.dropId, kind: "SUCCESS" },
+      await db.outreachSequence.count({
+        where: {
+          campaignContactId: {
+            in: [primary.campaignContactId, sibling.campaignContactId],
+          },
+          currentState: "COLD_CALL_ELIGIBLE",
+        },
       }),
     ).toBe(0);
   });
 
-  it("does not export a phone already attributed as a lead on another property", async () => {
-    const anchor = new Date("2026-09-28T14:00:00.000Z");
-    const fixture = await createOutreachFixture("known-lead", anchor);
-    await advanceFixtureToSmsEligibility(fixture, anchor, "known-lead");
-    const leadProperty = await db.property.create({
-      data: {
-        propertyAddress: "999 Prior Lead Lane",
-        source: `${prefix}-prior-lead`,
-      },
+  it("deduplicates delivery webhook events and ignores a status regression", async () => {
+    const acceptedAt = new Date("2030-01-08T15:00:00.000Z");
+    const providerMessageId = `${prefix}-delivery-message`;
+    const fixture = await createSmsFixture("delivery-status", {
+      anchor: acceptedAt,
+      messageStatus: "ACCEPTED",
+      campaignContactStatus: "ACCEPTED",
+      sequenceState: "SMS_ACCEPTED",
+      providerMessageId,
+      acceptedAt,
+      smsSentAt: acceptedAt,
+      coldCallDueAt: addHours(acceptedAt, 48),
     });
-    propertyIds.push(leadProperty.id);
-    const priorLeadContact = await db.campaignContact.create({
-      data: {
-        campaignId,
-        contactId: fixture.contactId,
-        propertyId: leadProperty.id,
-        status: "SKIPPED",
-      },
-    });
-    campaignContactIds.push(priorLeadContact.id);
-    await db.leadAttribution.create({
-      data: {
-        campaignContactId: priorLeadContact.id,
-        campaignId,
-        creditedChannel: "OTHER",
-        qualifyingOutcome: "QUALIFIED_LEAD",
-        attributedAt: anchor,
-      },
+    const deliveredAt = addHours(acceptedAt, 1);
+    const deliveredEvent = {
+      type: "delivery_status" as const,
+      providerKey,
+      providerEventId: `${prefix}-delivered-event`,
+      providerMessageId,
+      status: "delivered" as const,
+      occurredAt: deliveredAt.toISOString(),
+      segments: 2,
+      costMicros: 1_700,
+      currency: "USD",
+    };
+
+    const first = await processCanonicalSmsWebhook(deliveredEvent);
+    const replay = await processCanonicalSmsWebhook(deliveredEvent);
+    const lateSent = await processCanonicalSmsWebhook({
+      ...deliveredEvent,
+      providerEventId: `${prefix}-late-sent-event`,
+      status: "sent",
+      occurredAt: addHours(deliveredAt, 1).toISOString(),
     });
 
-    await expect(exportFixtureForSms(fixture, "known-lead")).rejects.toThrow(
-      /no eligible contacts/i,
-    );
-  });
-});
-
-describe("pg-boss durability", () => {
-  it("survives a producer restart and retries a failed PostgreSQL-backed job", async () => {
-    const schema = `pgboss_test_${randomUUID().replaceAll("-", "")}`;
-    const queue = `${prefix}-retry`;
-    const producer = new PgBoss({
-      connectionString: process.env.DATABASE_URL!,
-      schema,
+    expect(first).toMatchObject({
+      matched: true,
+      duplicate: false,
+      applied: true,
+      status: "DELIVERED",
     });
-    await producer.start();
-    await producer.createQueue(queue, { retryLimit: 1, retryDelay: 1 });
-    await producer.send(queue, { durable: true });
-    await producer.stop({ graceful: true });
-
-    const consumer = new PgBoss({
-      connectionString: process.env.DATABASE_URL!,
-      schema,
+    expect(replay).toMatchObject({
+      matched: true,
+      duplicate: true,
+      applied: false,
+      status: "DELIVERED",
     });
-    await consumer.start();
-    let attempts = 0;
-    const completed = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("Timed out waiting for pg-boss retry")),
-        20_000,
-      );
-      void consumer.work(
-        queue,
-        { pollingIntervalSeconds: 1 },
-        async ([job]) => {
-          attempts += 1;
-          if (attempts === 1) throw new Error("intentional integration retry");
-          expect(job.data).toEqual({ durable: true });
-          clearTimeout(timer);
-          resolve();
+    expect(lateSent).toMatchObject({
+      matched: true,
+      duplicate: false,
+      applied: false,
+      status: "DELIVERED",
+    });
+    expect(
+      await db.smsStatusEvent.count({
+        where: { messageId: fixture.messageId },
+      }),
+    ).toBe(2);
+    expect(
+      await db.smsOutboundMessage.findUnique({
+        where: { id: fixture.messageId },
+      }),
+    ).toMatchObject({
+      status: "DELIVERED",
+      deliveredAt,
+      actualSegmentCount: 2,
+      actualCostMicros: 1_700,
+    });
+    expect(
+      await db.smsUsageLedger.count({
+        where: { messageId: fixture.messageId },
+      }),
+    ).toBe(2);
+    expect(
+      await db.smsAuditEvent.count({
+        where: {
+          entityId: fixture.messageId,
+          eventType: "SMS_STATUS_IGNORED",
         },
-      );
+      }),
+    ).toBe(1);
+  });
+
+  it("uses the BatchDialer export claim to prevent an accidental duplicate export", async () => {
+    const sentAt = new Date("2030-01-09T15:00:00.000Z");
+    const eligibleAt = addHours(sentAt, 48);
+    const fixture = await createSmsFixture("batch-claim", {
+      anchor: sentAt,
+      messageStatus: "SENT",
+      campaignContactStatus: "SENT",
+      sequenceState: "COLD_CALL_ELIGIBLE",
+      providerMessageId: `${prefix}-batch-outbound`,
+      acceptedAt: sentAt,
+      sentAt,
+      smsSentAt: sentAt,
+      coldCallDueAt: eligibleAt,
+      coldCallEligibleAt: eligibleAt,
     });
-    await completed;
-    expect(attempts).toBe(2);
-    await consumer.stop({ graceful: true });
-    if (!/^pgboss_test_[a-f0-9]+$/.test(schema))
-      throw new Error("Unsafe test schema name");
-    await db.$executeRawUnsafe(`DROP SCHEMA "${schema}" CASCADE`);
+    const request = {
+      type: "BATCH_DIALER" as const,
+      campaignId,
+      source: fixture.source,
+      idempotencyKey: `${prefix}-batch-export-one`,
+      user: { id: adminId, role: "ADMIN" as const },
+    };
+
+    const first = await createOutreachExport(request);
+    const replay = await createOutreachExport(request);
+    expect(first).toMatchObject({ itemCount: 1, type: "BATCH_DIALER" });
+    expect(replay.id).toBe(first.id);
+    expect(
+      await db.outreachExportClaim.count({
+        where: { sequenceId: fixture.sequenceId, type: "BATCH_DIALER" },
+      }),
+    ).toBe(1);
+    expect(
+      await db.outreachExportItem.count({
+        where: { sequenceId: fixture.sequenceId },
+      }),
+    ).toBe(1);
+    await expect(
+      createOutreachExport({
+        ...request,
+        idempotencyKey: `${prefix}-batch-export-two`,
+      }),
+    ).rejects.toThrow(/eligible|already exported/i);
+    expect(
+      await db.outreachExport.count({
+        where: { idempotencyKey: { startsWith: `${prefix}-batch-export` } },
+      }),
+    ).toBe(1);
+
+    const firstHandoffAt = (
+      await db.outreachSequence.findUniqueOrThrow({
+        where: { id: fixture.sequenceId },
+      })
+    ).coldCallExportedAt;
+    const repeated = await createOutreachExport({
+      ...request,
+      idempotencyKey: `${prefix}-batch-export-repeat`,
+      intentionalRepeat: true,
+      repeatReason: "Operator requested a second dialer file",
+      confirmation: "RE-EXPORT",
+    });
+    expect(repeated).toMatchObject({
+      itemCount: 1,
+      intentionalRepeat: true,
+    });
+    expect(
+      await db.outreachExportClaim.count({
+        where: { sequenceId: fixture.sequenceId, type: "BATCH_DIALER" },
+      }),
+    ).toBe(1);
+    expect(
+      await db.outreachExportItem.findUniqueOrThrow({
+        where: {
+          exportId_sequenceId: {
+            exportId: repeated.id,
+            sequenceId: fixture.sequenceId,
+          },
+        },
+      }),
+    ).toMatchObject({ occurrence: 2 });
+    expect(
+      (
+        await db.outreachSequence.findUniqueOrThrow({
+          where: { id: fixture.sequenceId },
+        })
+      ).coldCallExportedAt,
+    ).toEqual(firstHandoffAt);
+
+    const download = await getOutreachExportCsv(first.id);
+    expect(download?.filename).toMatch(/^stonegate-batchdialer-/);
+    expect(download?.csv).toContain(fixture.phone);
+    expect(download?.csv).toContain("Stonegate Campaign Contact ID");
+  });
+
+  it("imports a cold-call outcome idempotently without mutating another SMS sequence", async () => {
+    const sentAt = new Date("2030-01-10T15:00:00.000Z");
+    const eligibleAt = addHours(sentAt, 48);
+    const target = await createSmsFixture("cold-call-import-target", {
+      anchor: sentAt,
+      messageStatus: "SENT",
+      campaignContactStatus: "SENT",
+      sequenceState: "COLD_CALL_ELIGIBLE",
+      providerMessageId: `${prefix}-cold-call-import-outbound`,
+      acceptedAt: sentAt,
+      sentAt,
+      smsSentAt: sentAt,
+      coldCallDueAt: eligibleAt,
+      coldCallEligibleAt: eligibleAt,
+    });
+    const untouched = await createSmsFixture("cold-call-import-untouched", {
+      anchor: sentAt,
+      contact: { id: target.contactId, phone: target.phone },
+      sequenceState: "SMS_QUEUED",
+    });
+    const exportRecord = await createOutreachExport({
+      type: "BATCH_DIALER",
+      campaignId,
+      source: target.source,
+      idempotencyKey: `${prefix}-cold-call-import-export`,
+      user: { id: adminId, role: "ADMIN" },
+    });
+    const bytes = Buffer.from(
+      [
+        "Stonegate Export ID,Stonegate Campaign Contact ID,Result,Occurred At,External ID",
+        `${exportRecord.id},${target.campaignContactId},NO_ANSWER,2030-01-13T15:00:00.000Z,${prefix}-call-1`,
+      ].join("\n"),
+    );
+    const preview = await previewColdCallOutcomes({ bytes });
+    expect(preview).toMatchObject({ total: 1, ready: 1, rejected: 0 });
+    const committed = await importColdCallOutcomes({
+      fileName: `${prefix}-batchdialer-outcomes.csv`,
+      bytes,
+      userId: adminId,
+      previewToken: preview.previewToken,
+    });
+    const replay = await importColdCallOutcomes({
+      fileName: `${prefix}-batchdialer-outcomes.csv`,
+      bytes,
+      userId: adminId,
+      previewToken: preview.previewToken,
+    });
+    expect(committed).toMatchObject({ accepted: 1, rejected: 0 });
+    expect(replay.importId).toBe(committed.importId);
+    expect(
+      await db.outreachSequence.findUniqueOrThrow({
+        where: { id: target.sequenceId },
+      }),
+    ).toMatchObject({ currentState: "COLD_CALL_NO_ANSWER" });
+    expect(
+      await db.outreachSequence.findUniqueOrThrow({
+        where: { id: untouched.sequenceId },
+      }),
+    ).toMatchObject({ currentState: "SMS_QUEUED", terminalAt: null });
+    expect(
+      await db.leadAttribution.count({
+        where: { campaignContactId: target.campaignContactId },
+      }),
+    ).toBe(0);
   });
 });

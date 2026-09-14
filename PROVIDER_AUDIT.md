@@ -1,67 +1,115 @@
-# Provider contract audit
+# SMS Provider Decision Record
 
-Audited against current official documentation on 2026-09-10. This file records the production assumptions implemented by the adapters; re-audit before changing a provider or enabling live RVM.
+## Status
 
-## Drop Cowboy
+No production SMS provider has been selected, audited, or configured for
+Stonegate SMS Outreach.
 
-Sources: [current OpenAPI](https://openapi.gitbook.com/o/YMHSxyoqvIdTRVRI2PAH/spec/drop-cowboy-api.yaml), [RVM API docs](https://drop-cowboy.gitbook.io/drop-cowboy-docs/api/sending-rvm-ringless-voicemail), [RVM webhooks](https://drop-cowboy.gitbook.io/drop-cowboy-docs/api/sending-rvm-ringless-voicemail/webhooks), and [sending limits](https://drop-cowboy.gitbook.io/drop-cowboy-docs/api/sending-limits).
+The only supported checked-in configuration is:
 
-`POST /v1/rvm` requires `team_id`, `secret`, `foreign_id`, `brand_id`, and `phone_number`. `foreign_id` is limited to 256 characters and `phone_number` is E.164. The API security scheme also requires `x-team-id` and `x-secret`, so the adapter supplies both headers and body credentials.
+```text
+SMS_LIVE_SENDS_ENABLED=false
+SMS_PROVIDER=dry-run
+```
 
-The mutually exclusive media choices are:
+No production credential, API endpoint, sender identity, webhook secret,
+pricing assumption, throughput claim, or activation instruction belongs in
+this document until a provider is selected and its current official contract
+has been reviewed.
 
-- `recording_id`: a portal recording approved for API use.
-- `voice_id` plus `tts_body`: Drop Cowboy Mimic TTS.
-- `audio_url` plus `audio_type` (`mp3` or `wav`): externally hosted audio; both fields require special approval.
+## Existing provider-neutral boundary
 
-Other published optional fields are `forwarding_number` (E.164), `phone_ivr_id`, `pool_id`, `postal_code`, `callback_url`, and wholesale-only `byoc`. Stonegate sends forwarding number, postal code when known, and an HTTPS per-request callback URL. It does not use Mimic, IVR, or pools. The current adapter does not yet send the optional `byoc` request field; confirm the exact account/API requirement with Drop Cowboy before live activation even though economics now reflect the supplied BYOC account quote.
+The application exposes an authenticated canonical endpoint at
+`POST /api/webhooks/sms`. It is disabled unless
+`SMS_PROVIDER_WEBHOOK_SECRET` is configured, requires an
+`x-stonegate-signature` HMAC-SHA256 signature over the exact request body, and
+rejects events whose `providerKey` differs from `SMS_PROVIDER`.
 
-The documented success response is only `{ "status": "string" }`; no provider message ID is assumed. The adapter preserves loose extra fields for audit but does not use them for identity.
+A future provider adapter must map the provider's verified delivery and inbound
+payloads into the canonical `delivery_status` or `inbound_message` contract.
+The mapping must include stable provider event/message IDs, explicit timestamps,
+and the original JSON object in `rawPayload`. This endpoint does not imply that
+any provider's native signature scheme has been reviewed or implemented.
 
-The public OpenAPI exposes `GET /recording` and `GET /media`, not a programmatic upload operation. Portal recordings expose `media_id`, name, creation time, and `api_allowed`. Consequently, there is no published upload-to-reusable-`recording_id` flow for per-contact ElevenLabs audio. Approved `audio_url` is the only published transport that preserves unique personalization; the typed RVM media union keeps a future transport swap isolated.
+## Required provider contract
 
-The webhook's documented fields are `drop_id`, `phone_number`, `attempt_date`, `status` (`success`/`failure`), `reason`, `dnc`, `product_cost`, `compliance_fee`, `tts_fee`, `network`, and the echoed `foreign_id`. The endpoint is unavailable until its signing secret is configured. The app maps success to delivered, failure to failed, and any `dnc=true` to opted-out/provider-DNC suppression. Raw costs are preserved because their unit/precision is not specified clearly enough to replace configured billing assumptions automatically. A first successful delivery records one successful-usage ledger entry; lower-priority or conflicting late events remain audited without regressing that final projection, while DNC always takes precedence.
+A candidate must support or have a documented operating answer for all of the
+following before implementation:
 
-### Account-specific BYOC economics
+- authenticated outbound SMS requests;
+- an idempotency mechanism or a safe application-side strategy for ambiguous
+  timeouts;
+- stable provider message identifiers;
+- documented queued, sent, delivered, failed, rejected, and unknown statuses;
+- authenticated delivery-event webhooks with replay guidance;
+- authenticated inbound message and opt-out events;
+- E.164 destination handling and clear invalid-number errors;
+- a known, normalized originating number that can be persisted before dispatch,
+  so inbound replies can be matched to the exact outbound message;
+- sender registration and account activation requirements;
+- account-specific throughput, queue, rate-limit, and retry behavior;
+- event timestamp format, precision, and out-of-order behavior;
+- sandbox, test-number, or other non-production validation support;
+- exportable usage and pricing data suitable for reconciliation;
+- documented data retention, redaction, and deletion controls.
 
-The following terms were supplied by Stonegate from its current account quote on 2026-09-14. They are business/account assumptions rather than claims about public list pricing and remain editable in Settings:
+Unknown or account-specific behavior must be recorded as an open question, not
+filled in from memory or another provider's conventions.
 
-- $250 monthly minimum/credit bucket.
-- $0.01 per successful RVM consumes that credit.
-- Failed attempts do not incur the success charge.
-- No Drop Cowboy compliance fee applies to this BYOC quote.
-- Successful usage above 25,000 messages continues at $0.01/success.
+## Evaluation process
 
-Accordingly, a complete billing period is modeled as `max(25,000 cents, successful RVM count × 1 cent)`. The code never adds the $250 to usage. Campaign reporting shows marginal successful-message usage separately from its allocated share of the period invoice. Allocation is proportional to campaign successes with deterministic largest-remainder cent rounding; a period with zero successes leaves the account minimum unallocated.
+1. Shortlist providers based on Stonegate's sending regions, expected volume,
+   sender type, inbound-reply needs, and operational support requirements.
+2. Review then-current official API, webhook, security, registration, and rate
+   documentation.
+3. Record the exact account/product tier being evaluated; do not assume public
+   list pricing or limits apply to Stonegate's account.
+4. Obtain a test account and prove outbound idempotency, delivery events,
+   inbound replies, opt-outs, invalid numbers, throttling, and ambiguous
+   timeouts.
+5. Confirm how provider timestamps and duplicate events map to the application's
+   append-only event ledger.
+6. Complete security, privacy, operational, and independent legal review.
+7. Document the decision, rejected alternatives, unresolved risks, and rollback
+   path before adding an adapter or secret variables.
 
-### Generic SIP carrier assumption
+## Minimum acceptance tests
 
-The carrier forecast is deliberately provider-generic, although its initial editable values come from the Twilio estimate supplied with the Drop Cowboy quote:
+- A dry-run campaign cannot make a provider network request.
+- The live switch alone cannot activate the `dry-run` adapter.
+- Replaying the same provider event changes state at most once.
+- Reusing a provider ID for conflicting contacts or outcomes is rejected.
+- An ambiguous request timeout cannot trigger an automatic duplicate send.
+- A reply stops later outreach for the intended contact.
+- A STOP, manual suppression, or campaign pause that wins the dispatch lock
+  prevents the provider call; if dispatch wins, its provider result is persisted
+  before the control action proceeds.
+- Opt-out, DNC, and wrong-number outcomes suppress the normalized phone across
+  campaigns.
+- A repeated `sent` event cannot restart the cold-call delay.
+- Invalid signatures fail closed without logging secrets.
+- A provider outage remains bounded by queue concurrency and retry policy.
 
-- $15/month SIP trunk.
-- $1.15/month per active DID.
-- Approximately $0.0066/minute blended voice rate.
+## Live activation gate
 
-The app records actual per-drop carrier seconds when they become available and otherwise uses an editable average-seconds-per-attempt forecast. Reports label estimated/mixed duration. This is SIP-carrier economics only; there is no Twilio Messaging integration or production SMS-send code.
+A production adapter is not complete merely because an API request succeeds.
+Before `SMS_LIVE_SENDS_ENABLED` can be changed, Stonegate must verify account
+activation, sender registration, webhook authentication, monitoring, alerting,
+support escalation, cost controls, message review, suppression behavior,
+rollback, and a deliberately limited acceptance batch.
 
-Not published for hosted media: maximum bytes/duration, HTTP redirect behavior, minimum URL validity window, media fetch retry policy, or retention after fetch. These are launch-blocking account questions. Cloudflare allows a presigned URL to live at most seven days; Stonegate defaults to 24 hours. Drop Cowboy states most drops complete within roughly five minutes but may hold requests outside local 8 a.m.–9 p.m. calling hours, which is why the former six-hour default was rejected.
+Stonegate is responsible for obtaining its own advice about consent,
+registration, quiet hours, disclosures, opt-out handling, record retention, and
+other applicable obligations. Application controls and this review process do
+not constitute a claim of compliance.
 
-Operational limits documented by Drop Cowboy are a soft 10,000 requests/second and fewer than 100 concurrent requests, with advance notice above 1,000 requests/second. Stonegate's default worker concurrency is four and the initial live campaign ceiling is ten—far below those transport limits. Consent, DNC, calling-hour, registration, and jurisdiction-specific compliance remain operational/legal prerequisites.
+## Render topology
 
-## ElevenLabs
+The existing Render Blueprint continues to define one web service, one worker,
+and one PostgreSQL database. Their resource identifiers intentionally retain
+the old names to preserve the deployed resources during the rebrand. Those
+identifiers do not imply that an archived provider or channel is active.
 
-Sources: [text-to-speech endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/convert) and [voice lookup](https://elevenlabs.io/docs/api-reference/voices/get).
-
-Generation uses `POST /v1/text-to-speech/{voice_id}` with `xi-api-key`, JSON `text` (required), `model_id`, and optional `voice_settings`. The output query is explicit and defaults to `mp3_44100_128`; the response body is audio. The adapter records `request-id` as the generation reference and `character-cost` when returned, falling back to input text length. Provider health performs only `GET /v1/voices/{voice_id}` and returns the non-secret voice name.
-
-## Cloudflare R2
-
-Sources: [S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/) and [presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/).
-
-The endpoint is `https://ACCOUNT_ID.r2.cloudflarestorage.com`, region is `auto`, writes use `PutObject`, diagnostics use `HeadBucket`, and playback/provider fetches use presigned `GetObject`. R2 documents presigned GET/HEAD/PUT/DELETE and an expiration range up to seven days. Buckets stay private; presigned URLs must be treated as temporary bearer credentials.
-
-## Render
-
-Sources: [Blueprint specification](https://render.com/docs/blueprint-spec) and [Render CLI](https://render.com/docs/cli).
-
-The Blueprint defines one Node web service, one Node worker, and one same-region PostgreSQL database. Both services use the database's internal `connectionString`; the web runs `prisma migrate deploy` in `preDeployCommand`, seeds only through `initialDeployHook`, exposes `/api/health`, and both processes have graceful shutdown windows. Every credential is `sync: false` or generated. Both live switches remain `false` in source control. pg-boss stores RVM work and the recurring outreach reconciliation schedule in PostgreSQL, so jobs and eligibility timestamps survive process replacement. The checked-in campaign and daily live ceilings remain 10 while the editable operating default is 2,000; these must be raised deliberately during ramp-up.
+Both services keep `SMS_PROVIDER=dry-run` and
+`SMS_LIVE_SENDS_ENABLED=false`. Any future provider secret must be configured
+through Render's secret environment settings and must never be committed.

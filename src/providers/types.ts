@@ -1,54 +1,77 @@
-export interface TTSGenerateInput {
-  text: string;
-  voiceId: string;
-  modelId: string;
-  settings?: Record<string, unknown>;
+export type SMSMetadataValue = string | number | boolean | null;
+
+/** Provider-neutral input for one outbound SMS attempt. */
+export interface SMSOutboundMessage {
+  /** Stable application key used to make retries idempotent. */
+  idempotencyKey: string;
+  to: string;
+  from?: string;
+  /** The complete rendered body. Providers must not silently truncate it. */
+  body: string;
+  clientReference?: string;
+  callbackUrl?: string;
+  metadata?: Readonly<Record<string, SMSMetadataValue>>;
 }
 
-export interface TTSGenerateResult {
-  bytes: Uint8Array;
-  contentType: string;
-  providerGenerationId?: string;
-  characterCount: number;
-  durationSeconds?: number;
-}
+export type SMSOutboundStatus =
+  | "dry_run"
+  | "accepted"
+  | "queued"
+  | "sent"
+  | "delivered"
+  | "undelivered"
+  | "rejected"
+  | "failed"
+  | "unknown";
 
-export interface TTSProvider {
-  readonly name: string;
-  generate(input: TTSGenerateInput): Promise<TTSGenerateResult>;
-}
-
-export interface AudioStorageProvider {
-  readonly name: string;
-  put(input: {
-    key: string;
-    bytes: Uint8Array;
-    contentType: string;
-  }): Promise<void>;
-  getReadUrl(key: string, expiresInSeconds?: number): Promise<string>;
-}
-
-export type RVMMedia =
-  | { strategy: "hosted_url"; url: string; audioType: "mp3" | "wav" }
-  | { strategy: "recording_id"; recordingId: string };
-
-export interface RVMSendInput {
-  foreignId: string;
-  phoneNumber: string;
-  media: RVMMedia;
-  postalCode?: string;
-  callbackUrl: string;
-}
-
-export interface RVMSendResult {
-  status: "dry_run" | "queued" | "sent";
+export interface SMSSendResult {
+  status: SMSOutboundStatus;
   providerMessageId?: string;
-  rawResponse: Record<string, unknown>;
+  segments?: number;
+  costMicros?: number;
+  currency?: string;
+  failureCode?: string;
+  failureReason?: string;
+  /** Stable hash of the behavior-affecting request fields. */
+  requestFingerprint: string;
+  rawResponse: Readonly<Record<string, unknown>>;
 }
 
-export interface RVMProvider {
+/** Normalized inbound message shape for a future provider webhook adapter. */
+export interface SMSInboundMessage {
+  providerMessageId: string;
+  providerConversationId?: string;
+  from: string;
+  to: string;
+  body: string;
+  receivedAt: Date;
+  media?: ReadonlyArray<{
+    url?: string;
+    contentType?: string;
+    providerMediaId?: string;
+  }>;
+  providerOptOut?: boolean;
+  rawPayload?: Readonly<Record<string, unknown>>;
+}
+
+/** Normalized delivery update shape for a future provider webhook adapter. */
+export interface SMSStatusUpdate {
+  providerEventId: string;
+  providerMessageId: string;
+  clientReference?: string;
+  status: Exclude<SMSOutboundStatus, "dry_run">;
+  occurredAt: Date;
+  segments?: number;
+  costMicros?: number;
+  currency?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  rawPayload?: Readonly<Record<string, unknown>>;
+}
+
+export interface SMSProvider {
   readonly name: string;
   readonly live: boolean;
   assertReadyForLiveSend(): Promise<void>;
-  send(input: RVMSendInput): Promise<RVMSendResult>;
+  send(input: SMSOutboundMessage): Promise<SMSSendResult>;
 }

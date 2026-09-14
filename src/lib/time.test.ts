@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  getBusinessSendWindowAvailability,
   getBillingPeriodBounds,
   getLocalDayBounds,
   getSendWindowAvailability,
@@ -47,5 +48,32 @@ describe("timezone-aware operating boundaries", () => {
       allowed: false,
       nextAllowedAt: new Date("2026-09-14T12:00:00.000Z"),
     });
+  });
+});
+
+describe("business-day SMS windows", () => {
+  it("moves a Saturday send to Monday morning in the campaign timezone", () => {
+    const availability = getBusinessSendWindowAvailability(
+      new Date("2026-09-19T16:00:00.000Z"),
+      "America/New_York",
+      "09:00",
+      "17:00",
+    );
+
+    expect(availability).toEqual({
+      allowed: false,
+      nextAllowedAt: new Date("2026-09-21T13:00:00.000Z"),
+    });
+  });
+
+  it("allows a weekday instant inside the local send window", () => {
+    expect(
+      getBusinessSendWindowAvailability(
+        new Date("2026-09-21T14:00:00.000Z"),
+        "America/New_York",
+        "09:00",
+        "17:00",
+      ),
+    ).toEqual({ allowed: true });
   });
 });

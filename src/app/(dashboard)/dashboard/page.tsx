@@ -1,14 +1,15 @@
-import Link from "next/link";
 import {
   ArrowRight,
   BadgeDollarSign,
-  Megaphone,
+  Download,
+  MessageSquareReply,
   PhoneCall,
+  Send,
+  ShieldCheck,
   Target,
-  Voicemail,
-  MessageSquareText,
-  Clock3,
 } from "lucide-react";
+import Link from "next/link";
+
 import { MetricCard } from "@/components/metric-card";
 import { StatusBadge } from "@/components/status-badge";
 import {
@@ -16,22 +17,26 @@ import {
   getOutreachFunnel,
   getTodayOperations,
 } from "@/lib/analytics";
-import { getMonthlyEconomics } from "@/lib/billing-economics";
 import { db } from "@/lib/db";
 import { formatCents } from "@/lib/utils";
 
+function money(value: number | null) {
+  return value == null ? "—" : formatCents(value);
+}
+
 export default async function DashboardPage() {
-  const [metrics, campaigns, today, funnel, monthly] = await Promise.all([
+  const [metrics, campaigns, today, funnel] = await Promise.all([
     getCampaignMetrics(),
     db.campaign.findMany({
+      where: { kind: "SMS" },
       orderBy: { createdAt: "desc" },
       take: 6,
       include: { _count: { select: { contacts: true } } },
     }),
     getTodayOperations(),
     getOutreachFunnel(),
-    getMonthlyEconomics(),
   ]);
+
   return (
     <>
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -40,139 +45,153 @@ export default async function DashboardPage() {
             Portfolio view
           </p>
           <h1 className="mt-1 text-3xl font-bold tracking-tight">
-            VM performance
+            SMS performance
           </h1>
           <p className="mt-1 text-sm text-slate-500">
-            Delivery, response, and acquisition economics at a glance.
+            Delivery, seller response, BatchDialer handoff, attribution, and
+            acquisition economics.
           </p>
         </div>
         <Link className="btn-primary" href="/campaigns/new">
           New campaign <ArrowRight className="h-4 w-4" />
         </Link>
       </div>
+
       <section className="mt-7">
         <div className="mb-3 flex items-end justify-between gap-3">
           <div>
             <p className="text-sm font-semibold text-emerald-700">
               Today · {today.date}
             </p>
-            <h2 className="text-lg font-bold">Sequence operations</h2>
+            <h2 className="text-lg font-bold">Operating pulse</h2>
           </div>
           <Link
             className="text-sm font-semibold text-emerald-700"
-            href="/outreach"
+            href="/operations"
           >
-            Open outreach queue
+            Open operations
           </Link>
         </div>
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
           <MetricCard
-            label="RVM progress"
-            value={`${today.rvmProcessed.toLocaleString()} / ${today.rvmScheduled.toLocaleString()}`}
-            detail={`${today.rvmRemaining.toLocaleString()} scheduled remaining`}
-            icon={Voicemail}
+            label="Live SMS remaining"
+            value={
+              today.liveSendsEnabled
+                ? today.globalAllowanceRemaining.toLocaleString()
+                : "Disabled"
+            }
+            detail={`${today.globalAttempted.toLocaleString()} reserved · ${today.globalAllowanceRemaining.toLocaleString()} remaining under ${today.globalDailyCap.toLocaleString()}/day cap`}
+            icon={ShieldCheck}
           />
           <MetricCard
-            label="Daily live allowance"
-            value={today.rvmAllowanceRemaining.toLocaleString()}
-            detail={`${today.rvmAttempted.toLocaleString()} attempted · safety cap ${today.environmentDailyCap.toLocaleString()}`}
-            icon={Clock3}
+            label="Sent today"
+            value={today.smsSent.toLocaleString()}
+            detail={`${today.smsDelivered.toLocaleString()} delivered`}
+            icon={Send}
           />
           <MetricCard
-            label="SMS awaiting export"
-            value={today.smsAwaitingExport.toLocaleString()}
-            detail={`${today.smsEligibleToday.toLocaleString()} newly eligible`}
-            icon={MessageSquareText}
-          />
-          <MetricCard
-            label="Cold-call awaiting export"
-            value={today.coldCallAwaitingExport.toLocaleString()}
-            detail={`${today.coldCallEligibleToday.toLocaleString()} newly eligible`}
-            icon={PhoneCall}
+            label="Replies today"
+            value={today.replies.toLocaleString()}
+            detail={`${today.interested.toLocaleString()} interested · ${today.optOuts.toLocaleString()} opt-outs`}
+            icon={MessageSquareReply}
           />
           <MetricCard
             label="Qualified today"
             value={today.qualifiedLeads.toLocaleString()}
-            detail={`${today.callbacks.toLocaleString()} callbacks · ${today.optOuts.toLocaleString()} opt-outs`}
+            detail={`${today.coldCallQualifiedLeads.toLocaleString()} credited to cold call`}
             icon={Target}
+          />
+          <MetricCard
+            label="Awaiting BatchDialer"
+            value={funnel.batchDialer.eligible.toLocaleString()}
+            detail={`${today.batchDialerEligible.toLocaleString()} became eligible today`}
+            icon={Download}
           />
         </div>
       </section>
-      <section className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+
+      <section className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+        <MetricCard
+          label="Sent"
+          value={metrics.sent.toLocaleString()}
+          detail={`${metrics.accepted.toLocaleString()} accepted`}
+          icon={Send}
+        />
         <MetricCard
           label="Delivered"
           value={metrics.delivered.toLocaleString()}
-          detail={`${metrics.deliveryRate.toFixed(1)}% delivery rate`}
-          icon={Voicemail}
+          detail={`${metrics.deliveryRate.toFixed(1)}% of sent`}
+          icon={Send}
         />
         <MetricCard
-          label="Callbacks"
-          value={metrics.callbacks.toLocaleString()}
-          detail={`${metrics.callbackRate.toFixed(2)}% of delivered`}
-          icon={PhoneCall}
+          label="Replies"
+          value={metrics.replies.toLocaleString()}
+          detail={`${metrics.replyRate.toFixed(1)}% of sent`}
+          icon={MessageSquareReply}
+        />
+        <MetricCard
+          label="Opt-outs"
+          value={metrics.optOuts.toLocaleString()}
+          detail={`${metrics.optOutRate.toFixed(1)}% of sent`}
+          icon={ShieldCheck}
         />
         <MetricCard
           label="Qualified leads"
           value={metrics.qualified.toLocaleString()}
-          detail={`${metrics.vaEquivalentConversations.toLocaleString()} VA-equivalent conversations`}
+          detail={`${metrics.channelAttribution.sms.toLocaleString()} SMS · ${metrics.channelAttribution.coldCall.toLocaleString()} cold-call`}
           icon={Target}
         />
         <MetricCard
-          label="Total spend"
-          value={formatCents(metrics.totalCents)}
-          detail={
-            metrics.costPerQualifiedLeadCents == null
-              ? "No lead cost yet"
-              : `${formatCents(metrics.costPerQualifiedLeadCents)} / qualified lead`
-          }
+          label="SMS variable cost"
+          value={formatCents(metrics.totalCostCents)}
+          detail={`${formatCents(metrics.configuredFixedMonthlyCents)}/mo fixed run-rate`}
           icon={BadgeDollarSign}
         />
-        <MetricCard
-          label="Closed revenue"
-          value={formatCents(metrics.revenueCents)}
-          detail={
-            metrics.roiPercent == null
-              ? "ROI pending"
-              : `${metrics.roiPercent.toFixed(0)}% estimated ROI`
-          }
-          icon={Megaphone}
-        />
       </section>
-      <section className="mt-7 grid gap-5 xl:grid-cols-[1.15fr_1fr]">
+
+      <section className="mt-7 grid gap-5 xl:grid-cols-[1.25fr_1fr]">
         <div>
-          <h2 className="mb-3 text-lg font-bold">Touch-separated funnel</h2>
+          <h2 className="mb-3 text-lg font-bold">Acquisition funnel</h2>
           <div className="table-wrap overflow-x-auto">
             <table className="data-table min-w-[680px]">
               <thead>
                 <tr>
-                  <th>Touch</th>
+                  <th>Channel / step</th>
                   <th>Entered</th>
-                  <th>Completed / sent</th>
+                  <th>Progress</th>
                   <th>Responses</th>
-                  <th>Credited leads</th>
+                  <th>Qualified leads</th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
-                  <td className="font-semibold">RVM</td>
-                  <td>{funnel.rvm.attempted.toLocaleString()} attempted</td>
-                  <td>{funnel.rvm.successful.toLocaleString()} successful</td>
-                  <td>{funnel.rvm.callbacks.toLocaleString()} callbacks</td>
-                  <td>{funnel.rvm.qualifiedLeads.toLocaleString()}</td>
-                </tr>
-                <tr>
-                  <td className="font-semibold">External SMS</td>
-                  <td>{funnel.sms.eligible.toLocaleString()} eligible</td>
-                  <td>{funnel.sms.sent.toLocaleString()} recorded sent</td>
+                  <td className="font-semibold">SMS</td>
+                  <td>{funnel.sms.attempted.toLocaleString()} attempted</td>
+                  <td>{funnel.sms.delivered.toLocaleString()} delivered</td>
                   <td>{funnel.sms.replies.toLocaleString()} replies</td>
                   <td>{funnel.sms.qualifiedLeads.toLocaleString()}</td>
                 </tr>
                 <tr>
+                  <td className="font-semibold">BatchDialer handoff</td>
+                  <td>
+                    {funnel.batchDialer.eligible.toLocaleString()} eligible
+                  </td>
+                  <td>
+                    {funnel.batchDialer.exported.toLocaleString()} exported
+                  </td>
+                  <td>—</td>
+                  <td>—</td>
+                </tr>
+                <tr>
                   <td className="font-semibold">Human cold call</td>
-                  <td>{funnel.coldCall.eligible.toLocaleString()} eligible</td>
-                  <td>{funnel.coldCall.exported.toLocaleString()} exported</td>
+                  <td>
+                    {funnel.batchDialer.exported.toLocaleString()} exported
+                  </td>
                   <td>
                     {funnel.coldCall.contacted.toLocaleString()} contacted
+                  </td>
+                  <td>
+                    {funnel.coldCall.contracts.toLocaleString()} contracts
                   </td>
                   <td>{funnel.coldCall.qualifiedLeads.toLocaleString()}</td>
                 </tr>
@@ -180,79 +199,38 @@ export default async function DashboardPage() {
             </table>
           </div>
         </div>
+
         <div>
-          <h2 className="mb-3 text-lg font-bold">Current provider period</h2>
+          <h2 className="mb-3 text-lg font-bold">Channel attribution</h2>
           <div className="card divide-y divide-slate-100 px-5">
             {[
+              ["SMS-qualified leads", metrics.channelAttribution.sms],
               [
-                "Period",
-                `${monthly.period.startsAt.toLocaleDateString()} – ${monthly.period.endsAt.toLocaleDateString()}`,
+                "Cold-call leads after SMS",
+                metrics.channelAttribution.coldCall,
               ],
-              [
-                "RVM attempted / successful",
-                `${monthly.attemptedRvmCount.toLocaleString()} / ${monthly.successfulRvmCount.toLocaleString()}`,
-              ],
-              [
-                "Drop Cowboy usage value",
-                formatCents(monthly.dropCowboy.usageValueCents),
-              ],
-              [
-                "Drop Cowboy monthly minimum",
-                formatCents(monthly.dropCowboy.monthlyMinimumCents),
-              ],
-              [
-                "Drop Cowboy invoice",
-                formatCents(monthly.dropCowboy.invoiceCents),
-              ],
-              [
-                "Unused minimum credit",
-                formatCents(monthly.dropCowboy.unusedMinimumCreditCents),
-              ],
-              [
-                `${monthly.pricing.carrierProviderName} carrier fixed`,
-                formatCents(monthly.carrier.fixedCents),
-              ],
-              [
-                `Carrier usage (${monthly.carrier.durationBasis.toLowerCase()})`,
-                formatCents(monthly.carrier.variableCents),
-              ],
-              ["Carrier total", formatCents(monthly.carrier.totalCents)],
-              [
-                "ElevenLabs generated",
-                formatCents(monthly.elevenLabsCostCents),
-              ],
-              [
-                "ElevenLabs characters",
-                monthly.elevenLabsCharacters.toLocaleString(),
-              ],
-              [
-                "Audio generations / reuses",
-                `${monthly.generatedAudioCount.toLocaleString()} / ${monthly.audioReuseCount.toLocaleString()}`,
-              ],
-              [
-                "Infrastructure overhead",
-                formatCents(monthly.infrastructureCents),
-              ],
-              ["Total period cost", formatCents(monthly.periodTotalCents)],
+              ["Other credited leads", metrics.channelAttribution.other],
+              ["Combined qualified leads", metrics.qualified],
+              ["SMS contracts", metrics.smsContracts],
+              ["Cold-call contracts", metrics.coldCallContracts],
+              ["Contracts, all channels", metrics.contracts],
+              ["Closed deals", metrics.closed],
             ].map(([label, value]) => (
               <div
                 className="flex items-center justify-between gap-4 py-3"
-                key={label}
+                key={String(label)}
               >
                 <span className="text-sm text-slate-600">{label}</span>
-                <strong className="text-right text-sm">{value}</strong>
+                <strong className="text-sm">
+                  {Number(value).toLocaleString()}
+                </strong>
               </div>
             ))}
           </div>
-          <p className="mt-2 text-xs leading-5 text-slate-500">
-            Shared minimum and fixed costs are allocated to campaigns by
-            successful RVMs and attempts, using deterministic largest-remainder
-            rounding. With no basis units, they remain unallocated account
-            overhead.
-          </p>
         </div>
       </section>
-      <section className="mt-7 grid gap-5 xl:grid-cols-[1.5fr_1fr]">
+
+      <section className="mt-7 grid gap-5 xl:grid-cols-[1.4fr_1fr]">
         <div>
           <div className="mb-3 flex items-center justify-between">
             <h2 className="text-lg font-bold">Recent campaigns</h2>
@@ -269,7 +247,7 @@ export default async function DashboardPage() {
                 <tr>
                   <th>Campaign</th>
                   <th>Status</th>
-                  <th>Eligible</th>
+                  <th>Contacts</th>
                   <th>Created</th>
                 </tr>
               </thead>
@@ -287,7 +265,7 @@ export default async function DashboardPage() {
                     <td>
                       <StatusBadge status={campaign.status} />
                     </td>
-                    <td>{campaign.eligibleCount.toLocaleString()}</td>
+                    <td>{campaign._count.contacts.toLocaleString()}</td>
                     <td>{campaign.createdAt.toLocaleDateString()}</td>
                   </tr>
                 ))}
@@ -297,7 +275,7 @@ export default async function DashboardPage() {
                       colSpan={4}
                       className="py-10 text-center text-slate-500"
                     >
-                      No campaigns yet. Import a list to get started.
+                      No SMS campaigns yet. Import a list to get started.
                     </td>
                   </tr>
                 ) : null}
@@ -305,35 +283,78 @@ export default async function DashboardPage() {
             </table>
           </div>
         </div>
+
         <div>
           <h2 className="mb-3 text-lg font-bold">Unit economics</h2>
           <div className="card divide-y divide-slate-100 px-5">
             {[
-              ["Cost / successful RVM", metrics.costPerDeliveredCents],
-              ["Cost / attempted RVM", metrics.costPerAttemptedCents],
-              ["Cost / callback", metrics.costPerCallbackCents],
+              ["Current variable SMS spend", metrics.totalCostCents],
+              [
+                "Configured fixed monthly run-rate",
+                metrics.configuredFixedMonthlyCents,
+              ],
+              ["Cost / sent", metrics.costPerSentCents],
+              ["Cost / delivered", metrics.costPerDeliveredCents],
+              ["Cost / reply", metrics.costPerReplyCents],
               ["Cost / interested seller", metrics.costPerInterestedCents],
               ["Cost / qualified lead", metrics.costPerQualifiedLeadCents],
               ["Cost / contract", metrics.costPerContractCents],
-              ["Cost / closed deal", metrics.actualCostPerClosedDealCents],
-              ["VA cost / qualified lead", metrics.vaCostPerQualifiedLeadCents],
+              ["Cost / closed deal", metrics.costPerClosedDealCents],
+              [
+                "VA benchmark / qualified lead",
+                metrics.vaCostPerQualifiedLeadCents,
+              ],
               [
                 "VA expected labor / deal",
                 metrics.vaExpectedLaborCostPerDealCents,
               ],
             ].map(([label, value]) => (
               <div
-                className="flex items-center justify-between py-3.5"
+                className="flex items-center justify-between gap-4 py-3"
                 key={String(label)}
               >
                 <span className="text-sm text-slate-600">{label}</span>
                 <strong className="text-sm">
-                  {value == null ? "—" : formatCents(Number(value))}
+                  {money(value == null ? null : Number(value))}
                 </strong>
               </div>
             ))}
           </div>
+          <p className="mt-2 text-xs leading-5 text-slate-500">
+            Provider pricing is configuration-driven. Actual reported message
+            cost replaces that message&apos;s estimate when available; no
+            carrier price is hardcoded. Fixed monthly fees are shown separately
+            and are not allocated into per-result costs without an explicit
+            allocation policy.
+          </p>
         </div>
+      </section>
+
+      <section className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <MetricCard
+          label="Nonresponders"
+          value={metrics.nonresponders.toLocaleString()}
+          detail={`${metrics.nonresponseRate.toFixed(1)}% of sent`}
+          icon={PhoneCall}
+        />
+        <MetricCard
+          label="BatchDialer exported"
+          value={metrics.batchDialerExported.toLocaleString()}
+          detail={`${metrics.batchDialerExportRate.toFixed(1)}% of handoff pool`}
+          icon={Download}
+        />
+        <MetricCard
+          label="Cold-call leads"
+          value={metrics.coldCallQualifiedLeads.toLocaleString()}
+          detail={`${metrics.coldCallContacted.toLocaleString()} contacted`}
+          icon={PhoneCall}
+        />
+        <MetricCard
+          label="Provider actual coverage"
+          value={`${metrics.providerActualCoverageRate.toFixed(1)}%`}
+          detail={`${metrics.messagesUsingEstimatedCost.toLocaleString()} messages still estimated`}
+          icon={BadgeDollarSign}
+        />
       </section>
     </>
   );

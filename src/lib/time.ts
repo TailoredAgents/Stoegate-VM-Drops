@@ -91,6 +91,25 @@ function calendarDate(
   };
 }
 
+function localWeekday(parts: Pick<ZonedDateParts, "year" | "month" | "day">) {
+  return new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay();
+}
+
+function nextBusinessDate(
+  year: number,
+  month: number,
+  day: number,
+  minimumOffsetDays = 1,
+) {
+  let offsetDays = minimumOffsetDays;
+  for (;;) {
+    const candidate = calendarDate(year, month, day, offsetDays);
+    const weekday = localWeekday(candidate);
+    if (weekday !== 0 && weekday !== 6) return candidate;
+    offsetDays += 1;
+  }
+}
+
 export function localDateKey(instant: Date, timeZone: string): string {
   const local = getZonedDateParts(instant, timeZone);
   return `${local.year.toString().padStart(4, "0")}-${local.month
@@ -221,4 +240,60 @@ export function getNextOperatingDayStart(
     },
     timeZone,
   );
+}
+
+/** Returns the next weekday start in local calendar time, including DST. */
+export function getNextBusinessDayStart(
+  instant: Date,
+  timeZone: string,
+  windowStart: string,
+) {
+  const local = getZonedDateParts(instant, timeZone);
+  const next = nextBusinessDate(local.year, local.month, local.day);
+  const startMinute = windowStart ? timeToMinutes(windowStart) : 0;
+  return zonedDateTimeToUtc(
+    {
+      ...next,
+      hour: Math.floor(startMinute / 60),
+      minute: startMinute % 60,
+    },
+    timeZone,
+  );
+}
+
+export function getBusinessSendWindowAvailability(
+  instant: Date,
+  timeZone: string,
+  start: string,
+  end: string,
+): { allowed: true } | { allowed: false; nextAllowedAt: Date } {
+  const local = getZonedDateParts(instant, timeZone);
+  const weekday = localWeekday(local);
+  if (weekday === 0 || weekday === 6) {
+    const next = nextBusinessDate(local.year, local.month, local.day);
+    const startMinute = start ? timeToMinutes(start) : 0;
+    return {
+      allowed: false,
+      nextAllowedAt: zonedDateTimeToUtc(
+        {
+          ...next,
+          hour: Math.floor(startMinute / 60),
+          minute: startMinute % 60,
+        },
+        timeZone,
+      ),
+    };
+  }
+
+  const availability = getSendWindowAvailability(instant, timeZone, start, end);
+  if (availability.allowed) return availability;
+
+  const nextLocal = getZonedDateParts(availability.nextAllowedAt, timeZone);
+  const nextWeekday = localWeekday(nextLocal);
+  if (nextWeekday !== 0 && nextWeekday !== 6) return availability;
+
+  return {
+    allowed: false,
+    nextAllowedAt: getNextBusinessDayStart(instant, timeZone, start),
+  };
 }

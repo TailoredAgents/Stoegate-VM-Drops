@@ -2,20 +2,15 @@ import type { Prisma, PrismaClient } from "@prisma/client";
 import { db } from "@/lib/db";
 
 export const NUMERIC_SETTINGS = {
-  elevenlabs_cost_per_1000_chars_cents: 30,
-  rvm_cost_per_delivered_drop_cents: 9,
-  compliance_cost_per_message_cents: 0,
-  rvm_to_sms_delay_hours: 24,
+  sms_provider_fixed_monthly_fee_cents: 0,
+  sms_cost_per_outbound_message_micros: 0,
+  sms_cost_per_segment_micros: 0,
+  sms_cost_per_inbound_message_micros: 0,
+  sms_phone_number_monthly_cents: 0,
+  sms_registration_monthly_cents: 0,
   sms_to_cold_call_delay_hours: 48,
-  daily_rvm_cap: 2000,
+  daily_sms_cap: 2000,
   provider_billing_cycle_day: 1,
-  drop_cowboy_monthly_minimum_cents: 25_000,
-  drop_cowboy_success_cost_cents: 1,
-  carrier_trunk_monthly_cents: 1_500,
-  carrier_did_monthly_cents: 115,
-  carrier_active_did_count: 1,
-  carrier_voice_cents_per_minute: 0.66,
-  carrier_average_seconds_per_attempt: 30,
   infrastructure_monthly_overhead_cents: 0,
   va_hourly_rate_cents: 700,
   va_real_conversations_per_hour: 6,
@@ -25,9 +20,11 @@ export const NUMERIC_SETTINGS = {
 
 export const TEXT_SETTINGS = {
   operations_timezone: "America/New_York",
-  rvm_send_window_start: "",
-  rvm_send_window_end: "",
-  carrier_provider_name: "Twilio",
+  sms_send_window_start: "09:00",
+  sms_send_window_end: "20:00",
+  sms_provider_display_name: "Not selected",
+  sms_sender_identification: "",
+  sms_compliance_notes: "",
 } as const;
 
 export const DEFAULT_SETTINGS = {
@@ -47,7 +44,7 @@ export type AppSettings = {
 type SettingsClient = PrismaClient | Prisma.TransactionClient;
 
 const positiveNumericSettings = new Set<NumericSettingKey>([
-  "daily_rvm_cap",
+  "daily_sms_cap",
   "provider_billing_cycle_day",
   "va_real_conversations_per_hour",
   "va_real_conversations_per_lead",

@@ -29,9 +29,8 @@ const environment: NodeJS.ProcessEnv = {
   APP_BASE_URL: process.env.APP_BASE_URL ?? "http://localhost:3000",
   SESSION_SECRET:
     process.env.SESSION_SECRET ?? "integration-test-session-secret-32-chars",
-  STONEGATE_INTEGRATION_API_KEY: "integration-test-api-key-32-chars",
-  AUDIO_GENERATION_LIVE_ENABLED: "false",
-  RVM_LIVE_SENDS_ENABLED: "false",
+  SMS_LIVE_SENDS_ENABLED: "false",
+  SMS_PROVIDER: "dry-run",
 };
 function run(modulePath: string, args: string[]) {
   const result = spawnSync(process.execPath, [modulePath, ...args], {

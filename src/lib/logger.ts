@@ -2,7 +2,7 @@ import pino from "pino";
 
 export const logger = pino({
   level: process.env.LOG_LEVEL ?? "info",
-  base: { service: "stonegate-vm-drops" },
+  base: { service: "stonegate-sms-outreach" },
   redact: {
     paths: [
       "req.headers.authorization",
@@ -10,8 +10,7 @@ export const logger = pino({
       "*.apiKey",
       "*.password",
       "*.token",
-      "DROP_COWBOY_SECRET",
-      "ELEVENLABS_API_KEY",
+      "SMS_PROVIDER_WEBHOOK_SECRET",
     ],
     censor: "[REDACTED]",
   },

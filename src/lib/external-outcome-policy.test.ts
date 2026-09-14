@@ -1,60 +1,85 @@
 import { describe, expect, it } from "vitest";
-import { assertExternalOutcomeAllowed } from "./external-outcome-policy";
+import {
+  assertColdCallOutcomeAllowed,
+  assertExternalOutcomeAllowed,
+  COLD_CALL_OUTCOMES,
+  normalizeColdCallOutcome,
+} from "./external-outcome-policy";
 
-const sentAt = new Date("2026-09-15T12:00:00.000Z");
+const exportedAt = new Date("2026-09-15T12:00:00.000Z");
 const base = {
-  currentState: "SMS_SENT_EXTERNAL" as const,
-  rvmSuccessfulAt: new Date("2026-09-14T10:00:00.000Z"),
-  smsEligibleAt: new Date("2026-09-15T10:00:00.000Z"),
-  smsExportedAt: new Date("2026-09-15T11:00:00.000Z"),
-  smsSentAt: sentAt,
-  coldCallExportedAt: null,
+  currentState: "COLD_CALL_EXPORTED" as const,
+  coldCallExportedAt: exportedAt,
 };
 
-describe("external outcome stage policy", () => {
-  it("requires a recorded SMS send before attributing a reply", () => {
+describe("cold-call outcome policy", () => {
+  it.each(COLD_CALL_OUTCOMES)(
+    "accepts %s only after a BatchDialer export",
+    (outcome) => {
+      expect(
+        assertColdCallOutcomeAllowed(
+          base,
+          outcome,
+          new Date("2026-09-15T13:00:00.000Z"),
+        ),
+      ).toMatchObject({ terminal: true });
+    },
+  );
+
+  it("normalizes provider-neutral aliases to the canonical vocabulary", () => {
+    expect(normalizeColdCallOutcome("Qualified Lead")).toBe("QUALIFIED_LEAD");
+    expect(normalizeColdCallOutcome("Do Not Call")).toBe("DNC");
+    expect(normalizeColdCallOutcome("No-Response")).toBe("NO_ANSWER");
+  });
+
+  it("requires a BatchDialer export even for a suppression", () => {
+    expect(() =>
+      assertColdCallOutcomeAllowed(
+        { ...base, coldCallExportedAt: null },
+        "DNC",
+        new Date("2026-09-15T13:00:00.000Z"),
+      ),
+    ).toThrow("not exported to BatchDialer");
+  });
+
+  it("rejects dispositions dated before the BatchDialer handoff", () => {
+    expect(() =>
+      assertColdCallOutcomeAllowed(
+        base,
+        "CONTACTED",
+        new Date("2026-09-15T11:59:59.999Z"),
+      ),
+    ).toThrow("before the BatchDialer export");
+  });
+
+  it("does not let a non-suppression overwrite a suppressed sequence", () => {
+    expect(() =>
+      assertColdCallOutcomeAllowed(
+        { ...base, currentState: "OPT_OUT" },
+        "INTERESTED",
+        new Date("2026-09-15T13:00:00.000Z"),
+      ),
+    ).toThrow("suppressed at OPT_OUT");
+    expect(() =>
+      assertColdCallOutcomeAllowed(
+        { ...base, currentState: "OPT_OUT" },
+        "DNC",
+        new Date("2026-09-15T13:00:00.000Z"),
+      ),
+    ).not.toThrow();
+  });
+
+  it("rejects SMS imports and SMS-only results", () => {
     expect(() =>
       assertExternalOutcomeAllowed(
-        { ...base, currentState: "SMS_EXPORTED", smsSentAt: null },
+        base,
         "SMS",
         "reply",
         new Date("2026-09-15T13:00:00.000Z"),
       ),
-    ).toThrow("recorded external send");
-  });
-
-  it("rejects a repeated sent command so it cannot reset the timer", () => {
-    expect(() =>
-      assertExternalOutcomeAllowed(base, "SMS", "sent", sentAt),
-    ).toThrow("already recorded");
-  });
-
-  it("requires a BatchDialer export before a cold-call outcome", () => {
-    expect(() =>
-      assertExternalOutcomeAllowed(
-        base,
-        "COLD_CALL",
-        "qualified lead",
-        new Date("2026-09-18T12:00:00.000Z"),
-      ),
-    ).toThrow("not exported");
-  });
-
-  it("always accepts a suppression classification after identity validation", () => {
-    expect(
-      assertExternalOutcomeAllowed(
-        {
-          currentState: "RVM_PENDING",
-          rvmSuccessfulAt: null,
-          smsEligibleAt: null,
-          smsExportedAt: null,
-          smsSentAt: null,
-          coldCallExportedAt: null,
-        },
-        "SMS",
-        "opt out",
-        sentAt,
-      ),
-    ).toMatchObject({ state: "OPT_OUT", suppress: "OPT_OUT" });
+    ).toThrow("Only COLD_CALL");
+    expect(() => normalizeColdCallOutcome("sent")).toThrow(
+      "Unsupported cold-call outcome",
+    );
   });
 });

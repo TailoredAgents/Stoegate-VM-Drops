@@ -1,4 +1,3 @@
-import { AttributionChannel, OutreachSequenceState } from "@prisma/client";
 import { z } from "zod";
 import { requireApiUser } from "@/lib/auth";
 import { createOutreachExport } from "@/lib/outreach-exports";
@@ -6,15 +5,15 @@ import { assertSameOrigin } from "@/lib/request-security";
 import { jsonError } from "@/lib/utils";
 
 const schema = z.object({
-  type: z.enum(["SMS_ELIGIBILITY", "BATCH_DIALER"]),
+  type: z.literal("BATCH_DIALER"),
   campaignId: z.uuid().optional(),
-  stage: z.nativeEnum(OutreachSequenceState).optional(),
   date: z
     .string()
     .regex(/^\d{4}-\d{2}-\d{2}$/)
     .optional(),
   source: z.string().trim().max(200).optional(),
-  creditedChannel: z.nativeEnum(AttributionChannel).optional(),
+  state: z.string().trim().max(100).optional(),
+  county: z.string().trim().max(200).optional(),
   idempotencyKey: z.uuid(),
   intentionalRepeat: z.boolean().optional(),
   repeatReason: z.string().trim().max(500).optional(),

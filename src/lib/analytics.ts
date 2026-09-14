@@ -1,135 +1,606 @@
 import {
-  type AttributionChannel,
-  Prisma,
+  type CampaignContactStatus,
+  type CampaignStatus,
   type OutreachSequenceState,
+  Prisma,
+  type SmsInboundClassification,
+  type SmsMessageStatus,
 } from "@prisma/client";
-import { getAttributableOutreachCosts } from "@/lib/billing-economics";
+import { calculateVABenchmarks } from "@/lib/costs";
 import { db } from "@/lib/db";
-import {
-  calculateBreakEvenCallbackRate,
-  calculateVABenchmarks,
-} from "@/lib/costs";
-import { campaignSpecificSourceFilter } from "@/lib/outreach-exports";
-import { getDailyRvmUsage } from "@/lib/rvm-operations";
+import { getEnv } from "@/lib/env";
 import { getAppSettings } from "@/lib/settings";
-import { getLocalDayBounds, zonedDateTimeToUtc } from "@/lib/time";
+import {
+  getLocalDayBounds,
+  localDateStorageValue,
+  zonedDateTimeToUtc,
+} from "@/lib/time";
 import { percent } from "@/lib/utils";
 
-function perUnit(total: number, count: number): number | null {
-  return count > 0 ? Math.round(total / count) : null;
+export type AnalyticsAttributionChannel = "SMS" | "COLD_CALL" | "OTHER";
+export type AnalyticsLeadFilter = boolean | "with_lead" | "without_lead";
+export type AnalyticsExportFilter =
+  boolean | "eligible" | "exported" | "not_exported";
+
+export interface AnalyticsFilters {
+  campaignId?: string;
+  campaignStatus?: CampaignStatus;
+  contactStatus?: CampaignContactStatus;
+  date?: string;
+  source?: string;
+  state?: string;
+  county?: string;
+  status?: SmsMessageStatus;
+  classification?: SmsInboundClassification;
+  lead?: AnalyticsLeadFilter;
+  export?: AnalyticsExportFilter;
+  stage?: OutreachSequenceState;
+  creditedChannel?: AnalyticsAttributionChannel;
 }
 
-function outcomeIdentity(outcome: {
-  campaignContactId: string | null;
-  normalizedPhone: string;
-}) {
-  return outcome.campaignContactId ?? outcome.normalizedPhone;
+export interface AnalyticsDateRange {
+  start: Date;
+  end: Date;
+  key: string;
+  storageDate: Date;
 }
 
-export interface AttributedOutcomeObservation {
-  campaignContactId: string | null;
-  outcome: string;
-  attributionChannel: AttributionChannel;
-  creditedRvmCallback?: boolean;
+export interface ChannelAttributionSummary {
+  sms: number;
+  coldCall: number;
+  other: number;
 }
 
-function normalizedOutcome(value: string) {
-  return value
-    .trim()
-    .toUpperCase()
-    .replace(/[\s-]+/g, "_");
+export interface SmsEconomicsInput {
+  attempted: number;
+  accepted: number;
+  sent: number;
+  delivered: number;
+  replies: number;
+  interested: number;
+  qualified: number;
+  nonresponders: number;
+  batchDialerEligible: number;
+  batchDialerExported: number;
+  coldCallQualifiedLeads: number;
+  contracts: number;
+  closed: number;
+  outboundSegments: number;
+  inboundMessages: number;
+  configuredOutboundMessageCostMicros: number;
+  configuredSegmentCostMicros: number;
+  configuredInboundMessageCostMicros: number;
+  configuredFixedMonthlyCents: number;
+  estimatedOutboundCostMicros: number;
+  providerActualCostMicros: number;
+  estimatedFallbackCostMicros: number;
+  messagesWithActualCost: number;
 }
 
-function isQualifiedOutcome(value: string) {
-  return ["QUALIFIED", "QUALIFIED_LEAD", "CONTRACT", "CLOSED"].includes(
-    normalizedOutcome(value),
-  );
-}
-
-const QUALIFIED_SEQUENCE_STATES: OutreachSequenceState[] = [
-  "QUALIFIED_LEAD",
-  "CONTRACT",
-  "CLOSED",
+const SENT_OR_LATER_STATUSES: SmsMessageStatus[] = [
+  "SENT",
+  "DELIVERED",
+  "UNDELIVERED",
+  "REPLIED",
 ];
+const INTERESTED_CLASSIFICATIONS: SmsInboundClassification[] = [
+  "INTERESTED",
+  "MAYBE",
+  "FOLLOW_UP",
+  "QUALIFIED_LEAD",
+];
+const QUEUED_STATUSES: SmsMessageStatus[] = [
+  "PENDING",
+  "SCHEDULED",
+  "QUEUED",
+  "SUBMITTING",
+];
+const CONTRACT_STATES: OutreachSequenceState[] = ["CONTRACT", "CLOSED"];
+export const QUALIFIED_LEAD_OUTCOMES = ["QUALIFIED_LEAD", "CONTRACT", "CLOSED"];
 
-export function countQualifiedAttributionsByChannel(
-  attributions: Array<{
-    campaignContactId: string;
-    creditedChannel: AttributionChannel;
-  }>,
-  qualifyingCampaignContactIds: Iterable<string>,
-) {
-  const qualifying = new Set(qualifyingCampaignContactIds);
-  const result: Record<AttributionChannel, number> = {
-    RVM_CALLBACK: 0,
-    SMS: 0,
-    COLD_CALL: 0,
-    OTHER: 0,
+function nonNegative(value: number | null | undefined): number {
+  return Number.isFinite(value) ? Math.max(0, value ?? 0) : 0;
+}
+
+function wholeCount(value: number | null | undefined): number {
+  return Math.trunc(nonNegative(value));
+}
+
+export function effectiveGlobalDailySmsCap(
+  configuredCap: number,
+  environmentCap: number,
+): number {
+  return Math.min(wholeCount(configuredCap), wholeCount(environmentCap));
+}
+
+export function isQualifiedLeadOutcome(
+  outcome: string | null | undefined,
+): boolean {
+  return Boolean(outcome && QUALIFIED_LEAD_OUTCOMES.includes(outcome));
+}
+
+export function qualifiedLeadCampaignContactWhere(
+  hasQualifiedLead: boolean,
+): Prisma.CampaignContactWhereInput {
+  const qualifyingOutcome = { in: QUALIFIED_LEAD_OUTCOMES };
+  if (hasQualifiedLead) {
+    return { leadAttribution: { is: { qualifyingOutcome } } };
+  }
+  return {
+    OR: [
+      { leadAttribution: { is: null } },
+      {
+        leadAttribution: {
+          is: { qualifyingOutcome: { notIn: QUALIFIED_LEAD_OUTCOMES } },
+        },
+      },
+    ],
   };
-  for (const attribution of attributions) {
-    if (qualifying.has(attribution.campaignContactId))
-      result[attribution.creditedChannel] += 1;
+}
+
+export function buildSmsCampaignInboundWhere(
+  extra: Prisma.SmsInboundMessageWhereInput = {},
+): Prisma.SmsInboundMessageWhereInput {
+  return {
+    AND: [
+      {
+        campaignContact: {
+          is: { campaign: { is: { kind: "SMS" } } },
+        },
+      },
+      extra,
+    ],
+  };
+}
+
+function perUnit(totalCents: number, count: number): number | null {
+  return count > 0 ? totalCents / count : null;
+}
+
+function normalizeFilters(input?: string | AnalyticsFilters): AnalyticsFilters {
+  if (typeof input === "string") return { campaignId: input };
+  return input ?? {};
+}
+
+/**
+ * Convert an operator-selected local calendar day into an exact UTC range.
+ * The midday reference keeps this correct across daylight-saving transitions.
+ */
+export function analyticsDateRange(
+  date: string,
+  timeZone: string,
+): AnalyticsDateRange {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date))
+    throw new Error("Analytics date must use YYYY-MM-DD");
+  const [year, month, day] = date.split("-").map(Number);
+  const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (!year || month < 1 || month > 12 || day < 1 || day > lastDay)
+    throw new Error("Analytics date is invalid");
+  const reference = zonedDateTimeToUtc(
+    { year, month, day, hour: 12, minute: 0 },
+    timeZone,
+  );
+  const range = getLocalDayBounds(reference, timeZone);
+  return {
+    ...range,
+    storageDate: localDateStorageValue(reference, timeZone),
+  };
+}
+
+function optionalDateRange(
+  date: string | undefined,
+  timeZone: string,
+): AnalyticsDateRange | undefined {
+  return date ? analyticsDateRange(date, timeZone) : undefined;
+}
+
+/** Build the reusable campaign-contact cohort without fetching any records. */
+export function buildAnalyticsCampaignContactWhere(
+  filters: AnalyticsFilters = {},
+): Prisma.CampaignContactWhereInput {
+  const clauses: Prisma.CampaignContactWhereInput[] = [
+    {
+      campaign: {
+        is: {
+          kind: "SMS",
+          ...(filters.campaignStatus ? { status: filters.campaignStatus } : {}),
+        },
+      },
+    },
+  ];
+
+  if (filters.campaignId) clauses.push({ campaignId: filters.campaignId });
+  if (filters.contactStatus) clauses.push({ status: filters.contactStatus });
+
+  const source = filters.source?.trim();
+  if (source) {
+    const textMatch = { contains: source, mode: "insensitive" as const };
+    clauses.push({
+      OR: [
+        { campaign: { is: { sourceName: textMatch } } },
+        {
+          importRow: {
+            is: {
+              mappedData: {
+                path: ["source"],
+                string_contains: source,
+                mode: "insensitive",
+              },
+            },
+          },
+        },
+        { property: { is: { source: textMatch } } },
+        { contact: { is: { source: textMatch } } },
+      ],
+    });
+  }
+
+  const state = filters.state?.trim();
+  if (state) {
+    clauses.push({
+      property: {
+        is: {
+          state: { equals: state.toUpperCase(), mode: "insensitive" },
+        },
+      },
+    });
+  }
+
+  const county = filters.county?.trim();
+  if (county) {
+    clauses.push({
+      property: {
+        is: { county: { contains: county, mode: "insensitive" } },
+      },
+    });
+  }
+
+  if (filters.status) {
+    clauses.push({ outboundMessages: { some: { status: filters.status } } });
+  }
+  if (filters.classification) {
+    clauses.push({
+      inboundMessages: { some: { classification: filters.classification } },
+    });
+  }
+
+  if (filters.lead === true || filters.lead === "with_lead") {
+    clauses.push(qualifiedLeadCampaignContactWhere(true));
+  } else if (filters.lead === false || filters.lead === "without_lead") {
+    clauses.push(qualifiedLeadCampaignContactWhere(false));
+  }
+  if (filters.creditedChannel) {
+    clauses.push({
+      leadAttribution: { is: { creditedChannel: filters.creditedChannel } },
+    });
+  }
+
+  const sequenceClauses: Prisma.OutreachSequenceWhereInput[] = [];
+  if (filters.stage) sequenceClauses.push({ currentState: filters.stage });
+  if (filters.export === true || filters.export === "exported") {
+    sequenceClauses.push({
+      exportClaims: { some: { type: "BATCH_DIALER" } },
+    });
+  } else if (filters.export === false || filters.export === "not_exported") {
+    sequenceClauses.push({
+      exportClaims: { none: { type: "BATCH_DIALER" } },
+    });
+  } else if (filters.export === "eligible") {
+    sequenceClauses.push(
+      { currentState: "COLD_CALL_ELIGIBLE" },
+      { exportClaims: { none: { type: "BATCH_DIALER" } } },
+    );
+  }
+  if (sequenceClauses.length > 0) {
+    clauses.push({ outreachSequence: { is: { AND: sequenceClauses } } });
+  }
+
+  return { AND: clauses };
+}
+
+export function summarizeChannelAttribution(
+  rows: ReadonlyArray<{
+    creditedChannel: string;
+    _count: { _all: number };
+  }>,
+): ChannelAttributionSummary {
+  const result: ChannelAttributionSummary = {
+    sms: 0,
+    coldCall: 0,
+    other: 0,
+  };
+  for (const row of rows) {
+    const count = wholeCount(row._count._all);
+    if (row.creditedChannel === "SMS") result.sms += count;
+    else if (row.creditedChannel === "COLD_CALL") result.coldCall += count;
+    else result.other += count;
   }
   return result;
 }
 
-export function summarizeAttributedOutcomeStages(
-  observations: AttributedOutcomeObservation[],
-) {
-  const callbacks = new Set<string>();
-  const interested = new Set<string>();
-  const qualified = new Set<string>();
-  const contracts = new Set<string>();
-  const closed = new Set<string>();
-  for (const observation of observations) {
-    const id = observation.campaignContactId;
-    if (!id) continue;
-    if (
-      observation.creditedRvmCallback &&
-      observation.attributionChannel === "RVM_CALLBACK"
-    ) {
-      callbacks.add(id);
-    }
-    const outcome = normalizedOutcome(observation.outcome);
-    if (
-      [
-        "INTERESTED",
-        "QUALIFIED",
-        "QUALIFIED_LEAD",
-        "CONTRACT",
-        "CLOSED",
-      ].includes(outcome)
-    )
-      interested.add(id);
-    if (["QUALIFIED", "QUALIFIED_LEAD", "CONTRACT", "CLOSED"].includes(outcome))
-      qualified.add(id);
-    if (["CONTRACT", "CLOSED"].includes(outcome)) contracts.add(id);
-    if (outcome === "CLOSED") closed.add(id);
-  }
+/**
+ * Mix provider-reported costs with per-message estimates only where an actual
+ * cost is absent. This avoids both discarding estimates and double-counting.
+ */
+export function summarizeSmsEconomics(input: SmsEconomicsInput) {
+  const attempted = wholeCount(input.attempted);
+  const segments = wholeCount(input.outboundSegments);
+  const inbound = wholeCount(input.inboundMessages);
+  const actualCostMessages = Math.min(
+    attempted,
+    wholeCount(input.messagesWithActualCost),
+  );
+  const configuredOutboundCostMicros =
+    attempted * nonNegative(input.configuredOutboundMessageCostMicros) +
+    segments * nonNegative(input.configuredSegmentCostMicros);
+  const configuredInboundCostMicros =
+    inbound * nonNegative(input.configuredInboundMessageCostMicros);
+  const configuredVariableCostMicros =
+    configuredOutboundCostMicros + configuredInboundCostMicros;
+  const estimatedSnapshotCostMicros =
+    nonNegative(input.estimatedOutboundCostMicros) +
+    configuredInboundCostMicros;
+  const providerActualCostMicros = nonNegative(input.providerActualCostMicros);
+  const estimatedFallbackCostMicros = nonNegative(
+    input.estimatedFallbackCostMicros,
+  );
+  const effectiveVariableCostMicros =
+    providerActualCostMicros +
+    estimatedFallbackCostMicros +
+    configuredInboundCostMicros;
+  const configuredFixedMonthlyCents = nonNegative(
+    input.configuredFixedMonthlyCents,
+  );
+  const variableCostCents = effectiveVariableCostMicros / 10_000;
+  // Fixed fees are a monthly run-rate, not attributable to an arbitrary
+  // campaign/date slice without an allocation policy.
+  const totalCostCents = variableCostCents;
+  const allInMonthlyRunRateCents =
+    configuredFixedMonthlyCents + variableCostCents;
+
   return {
-    callbacks: callbacks.size,
-    interested: interested.size,
-    qualified: qualified.size,
-    contracts: contracts.size,
-    closed: closed.size,
+    configuredOutboundCostMicros,
+    configuredInboundCostMicros,
+    configuredVariableCostMicros,
+    estimatedSnapshotCostMicros,
+    providerActualCostMicros,
+    estimatedFallbackCostMicros,
+    effectiveVariableCostMicros,
+    configuredVariableCostCents: configuredVariableCostMicros / 10_000,
+    estimatedSnapshotCostCents: estimatedSnapshotCostMicros / 10_000,
+    providerActualCostCents: providerActualCostMicros / 10_000,
+    estimatedFallbackCostCents: estimatedFallbackCostMicros / 10_000,
+    effectiveVariableCostCents: variableCostCents,
+    configuredFixedMonthlyCents,
+    variableCostCents,
+    totalCostCents,
+    allInMonthlyRunRateCents,
+    messagesWithActualCost: actualCostMessages,
+    messagesUsingEstimatedCost: Math.max(0, attempted - actualCostMessages),
+    providerActualCoverageRate: percent(actualCostMessages, attempted),
+    costPerAttemptCents: perUnit(totalCostCents, attempted),
+    costPerAcceptedCents: perUnit(totalCostCents, wholeCount(input.accepted)),
+    costPerSentCents: perUnit(totalCostCents, wholeCount(input.sent)),
+    costPerDeliveredCents: perUnit(totalCostCents, wholeCount(input.delivered)),
+    costPerReplyCents: perUnit(totalCostCents, wholeCount(input.replies)),
+    costPerInterestedCents: perUnit(
+      totalCostCents,
+      wholeCount(input.interested),
+    ),
+    costPerQualifiedLeadCents: perUnit(
+      totalCostCents,
+      wholeCount(input.qualified),
+    ),
+    costPerNonresponderCents: perUnit(
+      totalCostCents,
+      wholeCount(input.nonresponders),
+    ),
+    costPerBatchDialerEligibleCents: perUnit(
+      totalCostCents,
+      wholeCount(input.batchDialerEligible),
+    ),
+    costPerBatchDialerExportedCents: perUnit(
+      totalCostCents,
+      wholeCount(input.batchDialerExported),
+    ),
+    costPerColdCallLeadCents: perUnit(
+      totalCostCents,
+      wholeCount(input.coldCallQualifiedLeads),
+    ),
+    costPerContractCents: perUnit(totalCostCents, wholeCount(input.contracts)),
+    costPerClosedDealCents: perUnit(totalCostCents, wholeCount(input.closed)),
   };
 }
 
-export async function getCampaignMetrics(campaignId?: string) {
+/** Accepted is intentionally absent: provider acceptance does not prove send. */
+export function buildSentMessageLifecycleWhere(
+  range?: Pick<AnalyticsDateRange, "start" | "end">,
+): Prisma.SmsOutboundMessageWhereInput {
+  if (range) return { sentAt: { gte: range.start, lt: range.end } };
+  return {
+    OR: [{ sentAt: { not: null } }, { status: { in: SENT_OR_LATER_STATUSES } }],
+  };
+}
+
+function messageStatusClause(
+  status: SmsMessageStatus | undefined,
+): Prisma.SmsOutboundMessageWhereInput | undefined {
+  return status ? { status } : undefined;
+}
+
+function outboundMessageWhere(
+  cohort: Prisma.CampaignContactWhereInput,
+  filters: AnalyticsFilters,
+  extra?: Prisma.SmsOutboundMessageWhereInput,
+): Prisma.SmsOutboundMessageWhereInput {
+  return {
+    AND: [
+      { campaignContact: { is: cohort } },
+      ...(messageStatusClause(filters.status)
+        ? [messageStatusClause(filters.status)!]
+        : []),
+      ...(extra ? [extra] : []),
+    ],
+  };
+}
+
+function inboundMessageWhere(
+  cohort: Prisma.CampaignContactWhereInput,
+  filters: AnalyticsFilters,
+  range: AnalyticsDateRange | undefined,
+  extra?: Prisma.SmsInboundMessageWhereInput,
+): Prisma.SmsInboundMessageWhereInput {
+  return {
+    AND: [
+      { campaignContact: { is: cohort } },
+      ...(filters.classification
+        ? [{ classification: filters.classification }]
+        : []),
+      ...(range ? [{ receivedAt: { gte: range.start, lt: range.end } }] : []),
+      ...(extra ? [extra] : []),
+    ],
+  };
+}
+
+function eventWhere(
+  range: AnalyticsDateRange | undefined,
+  extra: Prisma.OutreachEventWhereInput,
+): Prisma.OutreachEventWhereInput {
+  return {
+    AND: [
+      extra,
+      ...(range ? [{ occurredAt: { gte: range.start, lt: range.end } }] : []),
+    ],
+  };
+}
+
+function rangeFor(
+  range: AnalyticsDateRange | undefined,
+): Prisma.DateTimeFilter | undefined {
+  return range ? { gte: range.start, lt: range.end } : undefined;
+}
+
+export async function getCampaignMetrics(input?: string | AnalyticsFilters) {
+  const filters = normalizeFilters(input);
   const settings = await getAppSettings();
-  const campaignWhere = campaignId ? { campaignId } : {};
+  const range = optionalDateRange(filters.date, settings.operations_timezone);
+  const dateFilter = rangeFor(range);
+  const cohort = buildAnalyticsCampaignContactWhere(filters);
+  const campaignWhere: Prisma.CampaignWhereInput = {
+    kind: "SMS",
+    ...(filters.campaignId ? { id: filters.campaignId } : {}),
+    ...(filters.campaignStatus ? { status: filters.campaignStatus } : {}),
+  };
+  const attemptedMessageWhere = outboundMessageWhere(cohort, filters, {
+    usageLedger: {
+      some: {
+        kind: "ATTEMPT",
+        ...(dateFilter ? { occurredAt: dateFilter } : {}),
+      },
+    },
+  });
+  const attemptLedgerWhere: Prisma.SmsUsageLedgerWhereInput = {
+    kind: "ATTEMPT",
+    ...(dateFilter ? { occurredAt: dateFilter } : {}),
+    message: {
+      is: outboundMessageWhere(cohort, filters),
+    },
+  };
+  const acceptedLedgerWhere: Prisma.SmsUsageLedgerWhereInput = {
+    kind: "ACCEPTED",
+    ...(dateFilter ? { occurredAt: dateFilter } : {}),
+    message: {
+      is: outboundMessageWhere(cohort, filters),
+    },
+  };
+  const deliveredLedgerWhere: Prisma.SmsUsageLedgerWhereInput = {
+    kind: "DELIVERED",
+    ...(dateFilter ? { occurredAt: dateFilter } : {}),
+    message: {
+      is: outboundMessageWhere(cohort, filters),
+    },
+  };
+  const replySome = inboundMessageWhere(cohort, filters, range);
+  const leadWhere: Prisma.LeadAttributionWhereInput = {
+    campaignContact: { is: cohort },
+    campaign: { is: { kind: "SMS" } },
+    ...(filters.creditedChannel
+      ? { creditedChannel: filters.creditedChannel }
+      : {}),
+    ...(dateFilter ? { attributedAt: dateFilter } : {}),
+    qualifyingOutcome: { in: QUALIFIED_LEAD_OUTCOMES },
+  };
+  const sequenceScope: Prisma.OutreachSequenceWhereInput = {
+    campaignContact: { is: cohort },
+  };
+  const sentCondition = buildSentMessageLifecycleWhere(range);
+  const coldCallContactEvent = eventWhere(range, {
+    channel: "COLD_CALL",
+    OR: [
+      { type: "COLD_CALL_CONTACTED" },
+      {
+        type: "OUTCOME_RECORDED",
+        resultingState: {
+          in: [
+            "INTERESTED",
+            "QUALIFIED_LEAD",
+            "FOLLOW_UP",
+            "NOT_INTERESTED",
+            "WRONG_NUMBER",
+            "OPT_OUT",
+            "CONTRACT",
+            "CLOSED",
+          ],
+        },
+      },
+    ],
+  });
+  const contractEvent = (channel?: "SMS" | "COLD_CALL") =>
+    eventWhere(range, {
+      ...(channel ? { channel } : { channel: { in: ["SMS", "COLD_CALL"] } }),
+      type: { not: "SEQUENCE_EXITED" },
+      resultingState: { in: CONTRACT_STATES },
+    });
+  const closedEvent = (channel?: "SMS" | "COLD_CALL") =>
+    eventWhere(range, {
+      ...(channel ? { channel } : { channel: { in: ["SMS", "COLD_CALL"] } }),
+      type: { not: "SEQUENCE_EXITED" },
+      resultingState: "CLOSED",
+    });
+
   const [
-    campaigns,
-    contactGroups,
-    dropGroups,
-    outcomes,
-    externalOutcomeEvents,
-    leadAttributions,
-    revenue,
-    costs,
+    campaignTotals,
+    contactStatusGroups,
+    selected,
+    queued,
+    dryRun,
+    attempted,
+    accepted,
+    sent,
+    delivered,
+    failed,
+    undelivered,
+    inboundMessages,
+    replies,
+    optOuts,
+    interested,
+    attributionGroups,
+    nonresponders,
+    batchDialerEligible,
+    batchDialerExported,
+    coldCallContacted,
+    contracts,
+    closed,
+    smsContracts,
+    smsClosed,
+    coldCallContracts,
+    coldCallClosed,
+    costAggregate,
+    fallbackCostAggregate,
+    currencyGroups,
   ] = await Promise.all([
     db.campaign.aggregate({
-      where: campaignId ? { id: campaignId } : {},
+      where: campaignWhere,
       _sum: {
         uploadedCount: true,
         eligibleCount: true,
@@ -140,92 +611,237 @@ export async function getCampaignMetrics(campaignId?: string) {
     }),
     db.campaignContact.groupBy({
       by: ["status"],
-      where: campaignWhere,
+      where: cohort,
       _count: { _all: true },
     }),
-    db.drop.groupBy({
-      by: ["status"],
-      where: { campaignContact: campaignWhere },
-      _count: { _all: true },
+    db.campaignContact.count({
+      where: { AND: [cohort, { selectedForSend: true }] },
     }),
-    db.callbackOutcome.findMany({
-      where: campaignId ? { campaignId } : {},
-      select: {
-        campaignContactId: true,
-        normalizedPhone: true,
-        outcome: true,
-        attributionChannel: true,
-      },
+    db.smsOutboundMessage.count({
+      where: outboundMessageWhere(cohort, filters, {
+        status: { in: QUEUED_STATUSES },
+        ...(dateFilter ? { scheduledFor: dateFilter } : {}),
+      }),
     }),
-    db.outreachEvent.findMany({
+    db.smsOutboundMessage.count({
+      where: outboundMessageWhere(cohort, filters, {
+        status: "DRY_RUN",
+        ...(dateFilter ? { createdAt: dateFilter } : {}),
+      }),
+    }),
+    db.smsUsageLedger.count({ where: attemptLedgerWhere }),
+    db.smsUsageLedger.count({ where: acceptedLedgerWhere }),
+    db.smsOutboundMessage.count({
+      where: outboundMessageWhere(cohort, filters, sentCondition),
+    }),
+    db.smsUsageLedger.count({ where: deliveredLedgerWhere }),
+    db.smsOutboundMessage.count({
+      where: outboundMessageWhere(cohort, filters, {
+        status: "FAILED",
+        ...(dateFilter ? { failedAt: dateFilter } : {}),
+      }),
+    }),
+    db.smsOutboundMessage.count({
+      where: outboundMessageWhere(cohort, filters, {
+        status: "UNDELIVERED",
+        ...(dateFilter ? { failedAt: dateFilter } : {}),
+      }),
+    }),
+    db.smsInboundMessage.count({ where: replySome }),
+    db.campaignContact.count({
       where: {
-        channel: { in: ["SMS", "COLD_CALL"] },
-        source: "external_outcome_import",
-        type: { not: "SEQUENCE_EXITED" },
-        outcome: { not: null },
-        ...(campaignId
-          ? { sequence: { campaignContact: { campaignId } } }
-          : {}),
-      },
-      select: {
-        channel: true,
-        outcome: true,
-        sequence: { select: { campaignContactId: true } },
-      },
-    }),
-    db.leadAttribution.findMany({
-      where: campaignId ? { campaignId } : undefined,
-      select: {
-        campaignContactId: true,
-        creditedChannel: true,
-        qualifyingOutcome: true,
+        AND: [
+          cohort,
+          {
+            inboundMessages: {
+              some: {
+                ...(filters.classification
+                  ? { classification: filters.classification }
+                  : {}),
+                ...(dateFilter ? { receivedAt: dateFilter } : {}),
+              },
+            },
+          },
+        ],
       },
     }),
-    db.callbackOutcome.aggregate({
-      where: campaignId ? { campaignId } : {},
-      _sum: { revenueCents: true },
+    db.campaignContact.count({
+      where: {
+        AND: [
+          cohort,
+          {
+            inboundMessages: {
+              some: {
+                isOptOut: true,
+                ...(filters.classification
+                  ? { classification: filters.classification }
+                  : {}),
+                ...(dateFilter ? { receivedAt: dateFilter } : {}),
+              },
+            },
+          },
+        ],
+      },
     }),
-    getAttributableOutreachCosts(campaignId),
+    db.campaignContact.count({
+      where: {
+        AND: [
+          cohort,
+          {
+            inboundMessages: {
+              some: {
+                classification: { in: INTERESTED_CLASSIFICATIONS },
+                ...(filters.classification
+                  ? { AND: [{ classification: filters.classification }] }
+                  : {}),
+                ...(dateFilter ? { receivedAt: dateFilter } : {}),
+              },
+            },
+          },
+        ],
+      },
+    }),
+    db.leadAttribution.groupBy({
+      by: ["creditedChannel"],
+      where: leadWhere,
+      _count: { _all: true },
+    }),
+    db.campaignContact.count({
+      where: {
+        AND: [
+          cohort,
+          {
+            outboundMessages: {
+              some: {
+                ...sentCondition,
+                ...(filters.status ? { status: filters.status } : {}),
+              },
+            },
+            inboundMessages: { none: {} },
+            leadAttribution: { is: null },
+          },
+        ],
+      },
+    }),
+    db.outreachSequence.count({
+      where: {
+        AND: [
+          sequenceScope,
+          {
+            currentState: "COLD_CALL_ELIGIBLE",
+            exportClaims: { none: { type: "BATCH_DIALER" } },
+            ...(dateFilter ? { coldCallEligibleAt: dateFilter } : {}),
+          },
+        ],
+      },
+    }),
+    db.outreachSequence.count({
+      where: {
+        AND: [
+          sequenceScope,
+          {
+            exportClaims: {
+              some: {
+                type: "BATCH_DIALER",
+                ...(dateFilter ? { claimedAt: dateFilter } : {}),
+              },
+            },
+          },
+        ],
+      },
+    }),
+    db.outreachSequence.count({
+      where: {
+        AND: [sequenceScope, { events: { some: coldCallContactEvent } }],
+      },
+    }),
+    db.outreachSequence.count({
+      where: { AND: [sequenceScope, { events: { some: contractEvent() } }] },
+    }),
+    db.outreachSequence.count({
+      where: { AND: [sequenceScope, { events: { some: closedEvent() } }] },
+    }),
+    db.outreachSequence.count({
+      where: {
+        AND: [sequenceScope, { events: { some: contractEvent("SMS") } }],
+      },
+    }),
+    db.outreachSequence.count({
+      where: { AND: [sequenceScope, { events: { some: closedEvent("SMS") } }] },
+    }),
+    db.outreachSequence.count({
+      where: {
+        AND: [sequenceScope, { events: { some: contractEvent("COLD_CALL") } }],
+      },
+    }),
+    db.outreachSequence.count({
+      where: {
+        AND: [sequenceScope, { events: { some: closedEvent("COLD_CALL") } }],
+      },
+    }),
+    db.smsOutboundMessage.aggregate({
+      where: attemptedMessageWhere,
+      _sum: {
+        segmentCount: true,
+        actualSegmentCount: true,
+        estimatedCostMicros: true,
+        actualCostMicros: true,
+      },
+      _count: { _all: true, actualCostMicros: true },
+    }),
+    db.smsOutboundMessage.aggregate({
+      where: {
+        AND: [attemptedMessageWhere, { actualCostMicros: null }],
+      },
+      _sum: { estimatedCostMicros: true },
+    }),
+    db.smsOutboundMessage.groupBy({
+      by: ["currency"],
+      where: attemptedMessageWhere,
+      _count: { _all: true },
+    }),
   ]);
 
-  const dropCount = (status: string) =>
-    dropGroups.find((row) => row.status === status)?._count._all ?? 0;
-  const stageObservations: AttributedOutcomeObservation[] = [
-    ...outcomes.map((outcome) => ({
-      campaignContactId: outcome.campaignContactId,
-      outcome: outcome.outcome,
-      attributionChannel: outcome.attributionChannel,
-      creditedRvmCallback: outcome.attributionChannel === "RVM_CALLBACK",
-    })),
-    ...externalOutcomeEvents.flatMap((event) =>
-      event.outcome
-        ? [
-            {
-              campaignContactId: event.sequence.campaignContactId,
-              outcome: event.outcome,
-              attributionChannel: event.channel as AttributionChannel,
-            },
-          ]
-        : [],
-    ),
-    ...leadAttributions.map((attribution) => ({
-      campaignContactId: attribution.campaignContactId,
-      outcome: attribution.qualifyingOutcome,
-      attributionChannel: attribution.creditedChannel,
-    })),
-  ];
-  const stages = summarizeAttributedOutcomeStages(stageObservations);
-  const rvmStages = summarizeAttributedOutcomeStages(
-    stageObservations.filter(
-      (observation) => observation.attributionChannel === "RVM_CALLBACK",
-    ),
-  );
-  const delivered = costs.successful;
-  const failed = dropCount("FAILED");
-  const queued = dropCount("QUEUED") + dropCount("SENT") + dropCount("PENDING");
-  const { callbacks, interested, qualified, contracts, closed } = stages;
-  const totalCents = costs.totalAttributableCents;
-  const revenueCents = revenue._sum.revenueCents ?? 0;
+  const channelAttribution = summarizeChannelAttribution(attributionGroups);
+  const qualified =
+    channelAttribution.sms +
+    channelAttribution.coldCall +
+    channelAttribution.other;
+  const coldCallQualifiedLeads = channelAttribution.coldCall;
+  const unsuccessful = failed + undelivered;
+  const configuredFixedMonthlyCents =
+    settings.sms_provider_fixed_monthly_fee_cents +
+    settings.sms_phone_number_monthly_cents +
+    settings.sms_registration_monthly_cents +
+    settings.infrastructure_monthly_overhead_cents;
+  const economics = summarizeSmsEconomics({
+    attempted,
+    accepted,
+    sent,
+    delivered,
+    replies,
+    interested,
+    qualified,
+    nonresponders,
+    batchDialerEligible,
+    batchDialerExported,
+    coldCallQualifiedLeads,
+    contracts,
+    closed,
+    outboundSegments: costAggregate._sum.segmentCount ?? 0,
+    inboundMessages,
+    configuredOutboundMessageCostMicros:
+      settings.sms_cost_per_outbound_message_micros,
+    configuredSegmentCostMicros: settings.sms_cost_per_segment_micros,
+    configuredInboundMessageCostMicros:
+      settings.sms_cost_per_inbound_message_micros,
+    configuredFixedMonthlyCents,
+    estimatedOutboundCostMicros: costAggregate._sum.estimatedCostMicros ?? 0,
+    providerActualCostMicros: costAggregate._sum.actualCostMicros ?? 0,
+    estimatedFallbackCostMicros:
+      fallbackCostAggregate._sum.estimatedCostMicros ?? 0,
+    messagesWithActualCost: costAggregate._count.actualCostMicros,
+  });
   const va = calculateVABenchmarks(
     {
       hourlyRateCents: settings.va_hourly_rate_cents,
@@ -235,361 +851,272 @@ export async function getCampaignMetrics(campaignId?: string) {
     },
     qualified,
   );
-  const qualifiedPerCallback =
-    callbacks > 0 ? rvmStages.qualified / callbacks : 0;
+  const expectedDeals = qualified / settings.va_leads_per_deal;
+
   return {
-    uploaded: campaigns._sum.uploadedCount ?? 0,
-    eligible: campaigns._sum.eligibleCount ?? 0,
-    suppressed: campaigns._sum.suppressedCount ?? 0,
-    invalid: campaigns._sum.invalidCount ?? 0,
-    duplicate: campaigns._sum.duplicateCount ?? 0,
-    audioGenerated: costs.generatedAudioCount,
-    audioReuseCount: costs.audioReuseCount,
-    elevenLabsCharacters: costs.elevenLabsCharacters,
+    date: range?.key ?? null,
+    timezone: settings.operations_timezone,
+    uploaded: campaignTotals._sum.uploadedCount ?? 0,
+    eligible: campaignTotals._sum.eligibleCount ?? 0,
+    suppressed: campaignTotals._sum.suppressedCount ?? 0,
+    invalid: campaignTotals._sum.invalidCount ?? 0,
+    duplicate: campaignTotals._sum.duplicateCount ?? 0,
+    selected,
     queued,
-    attempted: costs.attempted,
+    dryRun,
+    attempted,
+    accepted,
+    sent,
     delivered,
     failed,
-    deliveryRate: percent(delivered, delivered + failed),
-    rvmSuccessRate: costs.rvmSuccessRate,
-    callbacks,
-    callbackRate: percent(callbacks, delivered),
+    undelivered,
+    unsuccessful,
+    acceptanceRate: percent(accepted, attempted),
+    sendRate: percent(sent, attempted),
+    acceptedToSentRate: percent(sent, accepted),
+    deliveryRate: percent(delivered, sent),
+    failureRate: percent(unsuccessful, attempted),
+    inboundMessages,
+    replies,
+    replyRate: percent(replies, sent),
+    optOuts,
+    optOutRate: percent(optOuts, sent),
     interested,
-    interestedCallbackRate: percent(rvmStages.interested, callbacks),
+    interestedRate: percent(interested, replies),
     qualified,
-    callbackToQualifiedRate: percent(rvmStages.qualified, callbacks),
+    qualificationRate: percent(channelAttribution.sms, interested),
+    rateBasis: range ? "EVENT_ACTIVITY" : "ALL_TIME_LIFECYCLE",
+    nonresponders,
+    nonresponseRate: percent(nonresponders, sent),
+    batchDialerEligible,
+    batchDialerExported,
+    batchDialerExportRate: percent(
+      batchDialerExported,
+      batchDialerEligible + batchDialerExported,
+    ),
+    coldCallContacted,
+    coldCallQualifiedLeads,
+    coldCallContracts,
+    coldCallClosed,
     contracts,
     closed,
-    revenueCents,
-    expectedDeals: qualified / settings.va_leads_per_deal,
-    ttsCents: costs.elevenLabsCents,
-    rvmCents: costs.allocatedDropCowboyCents,
-    marginalDropCowboyCents: costs.marginalDropCowboyCents,
-    allocatedDropCowboyCents: costs.allocatedDropCowboyCents,
-    carrierFixedCents: costs.carrierFixedCents,
-    carrierVariableCents: costs.carrierVariableCents,
-    carrierTotalCents: costs.carrierTotalCents,
-    infrastructureCents: costs.infrastructureCents,
-    complianceCents: 0,
-    totalCents,
-    costPerAttemptedCents: perUnit(totalCents, costs.attempted),
-    costPerDeliveredCents: perUnit(totalCents, delivered),
-    costPerCallbackCents: perUnit(totalCents, callbacks),
-    costPerInterestedCents: perUnit(totalCents, interested),
-    costPerQualifiedLeadCents: perUnit(totalCents, qualified),
-    costPerContractCents: perUnit(totalCents, contracts),
-    actualCostPerClosedDealCents: perUnit(totalCents, closed),
-    roiPercent:
-      totalCents > 0 ? ((revenueCents - totalCents) / totalCents) * 100 : null,
+    smsContracts,
+    smsClosed,
+    channelAttribution,
+    outboundSegments: costAggregate._sum.segmentCount ?? 0,
+    providerReportedSegments: costAggregate._sum.actualSegmentCount ?? 0,
+    currency:
+      currencyGroups.length === 0
+        ? "USD"
+        : currencyGroups.length === 1
+          ? currencyGroups[0].currency
+          : "MIXED",
+    hasMixedCurrencies: currencyGroups.length > 1,
+    ...economics,
     ...va,
+    expectedDeals,
     costPerExpectedDealCents:
-      qualified > 0
-        ? Math.round(totalCents / (qualified / settings.va_leads_per_deal))
-        : null,
-    rvmVsVaCostPerLeadDifferenceCents:
-      qualified === 0
+      expectedDeals > 0 ? economics.totalCostCents / expectedDeals : null,
+    smsSavingsVsVaPerQualifiedLeadCents:
+      economics.costPerQualifiedLeadCents == null
         ? null
-        : va.vaCostPerQualifiedLeadCents - Math.round(totalCents / qualified),
-    breakEvenCallbackRate: calculateBreakEvenCallbackRate(
-      totalCents,
-      delivered,
-      va.vaCostPerQualifiedLeadCents,
-      qualifiedPerCallback,
-    ),
+        : va.vaCostPerQualifiedLeadCents - economics.costPerQualifiedLeadCents,
     contactStatusCounts: Object.fromEntries(
-      contactGroups.map((row) => [row.status, row._count._all]),
-    ),
+      contactStatusGroups.map((row) => [row.status, row._count._all]),
+    ) as Partial<Record<CampaignContactStatus, number>>,
   };
 }
 
-export async function getOutreachFunnel(campaignId?: string) {
-  const [events, states, attributions, attributedCallbackOutcomes] =
-    await Promise.all([
-      db.outreachEvent.findMany({
-        where: campaignId
-          ? { sequence: { campaignContact: { campaignId } } }
-          : undefined,
-        select: {
-          sequenceId: true,
-          type: true,
-          channel: true,
-          source: true,
-          resultingState: true,
-          sequence: { select: { campaignContactId: true } },
-        },
-      }),
-      db.outreachSequence.groupBy({
-        by: ["currentState"],
-        where: campaignId ? { campaignContact: { campaignId } } : undefined,
-        _count: { _all: true },
-      }),
-      db.leadAttribution.findMany({
-        where: campaignId ? { campaignId } : undefined,
-        select: { campaignContactId: true, creditedChannel: true },
-      }),
-      db.callbackOutcome.findMany({
-        where: {
-          campaignContactId: { not: null },
-          ...(campaignId ? { campaignId } : {}),
-        },
-        select: {
-          campaignContactId: true,
-          attributionChannel: true,
-          outcome: true,
-        },
-      }),
-    ]);
-  const eventCount = (
-    types: Array<(typeof events)[number]["type"]>,
-    channel?: (typeof events)[number]["channel"],
-  ) =>
-    new Set(
-      events
-        .filter(
-          (event) =>
-            types.includes(event.type) &&
-            (!channel || event.channel === channel),
-        )
-        .map((event) => event.sequenceId),
-    ).size;
-  const qualifyingCampaignContacts = new Set([
-    ...attributedCallbackOutcomes.flatMap((outcome) =>
-      outcome.campaignContactId && isQualifiedOutcome(outcome.outcome)
-        ? [outcome.campaignContactId]
-        : [],
-    ),
-    ...events.flatMap((event) =>
-      ["SMS", "COLD_CALL"].includes(event.channel) &&
-      event.source === "external_outcome_import" &&
-      event.type !== "SEQUENCE_EXITED" &&
-      QUALIFIED_SEQUENCE_STATES.includes(event.resultingState)
-        ? [event.sequence.campaignContactId]
-        : [],
-    ),
+export async function getOutreachFunnel(input?: string | AnalyticsFilters) {
+  const filters = normalizeFilters(input);
+  const settings = await getAppSettings();
+  const range = optionalDateRange(filters.date, settings.operations_timezone);
+  const cohort = buildAnalyticsCampaignContactWhere(filters);
+  const [metrics, stateGroups] = await Promise.all([
+    getCampaignMetrics(filters),
+    db.outreachSequence.groupBy({
+      by: ["currentState"],
+      where: {
+        campaignContact: { is: cohort },
+        ...(range ? { lastEventAt: { gte: range.start, lt: range.end } } : {}),
+      },
+      _count: { _all: true },
+    }),
   ]);
-  const qualifiedByChannel = countQualifiedAttributionsByChannel(
-    attributions,
-    qualifyingCampaignContacts,
-  );
-  const rvmCallbackCount = new Set(
-    attributedCallbackOutcomes.flatMap((outcome) =>
-      outcome.campaignContactId && outcome.attributionChannel === "RVM_CALLBACK"
-        ? [outcome.campaignContactId]
-        : [],
-    ),
-  ).size;
-  const coldCallContacted = new Set(
-    events
-      .filter(
-        (event) =>
-          event.channel === "COLD_CALL" &&
-          event.source === "external_outcome_import" &&
-          (event.type === "COLD_CALL_CONTACTED" ||
-            (event.type === "OUTCOME_RECORDED" &&
-              [
-                "INTERESTED",
-                "QUALIFIED_LEAD",
-                "FOLLOW_UP",
-                "NOT_INTERESTED",
-                "OPT_OUT",
-                "CONTRACT",
-                "CLOSED",
-              ].includes(event.resultingState))),
-      )
-      .map((event) => event.sequenceId),
-  ).size;
+
   return {
-    rvm: {
-      attempted: eventCount(["RVM_SENT"]),
-      successful: eventCount(["RVM_SUCCESS"]),
-      callbacks: rvmCallbackCount,
-      qualifiedLeads: qualifiedByChannel.RVM_CALLBACK,
-    },
     sms: {
-      eligible: eventCount(["SMS_ELIGIBLE"]),
-      exported: eventCount(["SMS_EXPORTED"]),
-      sent: eventCount(["SMS_SENT_EXTERNAL"]),
-      replies: eventCount(["SMS_REPLIED", "OUTCOME_RECORDED"], "SMS"),
-      qualifiedLeads: qualifiedByChannel.SMS,
+      queued: metrics.queued,
+      dryRun: metrics.dryRun,
+      attempted: metrics.attempted,
+      accepted: metrics.accepted,
+      sent: metrics.sent,
+      delivered: metrics.delivered,
+      failed: metrics.failed,
+      undelivered: metrics.undelivered,
+      replies: metrics.replies,
+      optOuts: metrics.optOuts,
+      interested: metrics.interested,
+      qualifiedLeads: metrics.channelAttribution.sms,
+      nonresponders: metrics.nonresponders,
+      contracts: metrics.smsContracts,
+      closed: metrics.smsClosed,
+    },
+    batchDialer: {
+      eligible: metrics.batchDialerEligible,
+      exported: metrics.batchDialerExported,
+      exportRate: metrics.batchDialerExportRate,
     },
     coldCall: {
-      eligible: eventCount(["COLD_CALL_ELIGIBLE"]),
-      exported: eventCount(["COLD_CALL_EXPORTED"]),
-      contacted: coldCallContacted,
-      qualifiedLeads: qualifiedByChannel.COLD_CALL,
+      contacted: metrics.coldCallContacted,
+      qualifiedLeads: metrics.coldCallQualifiedLeads,
+      contracts: metrics.coldCallContracts,
+      closed: metrics.coldCallClosed,
     },
-    otherQualifiedLeads: qualifiedByChannel.OTHER,
+    channelAttribution: metrics.channelAttribution,
     stateCounts: Object.fromEntries(
-      states.map((row) => [row.currentState, row._count._all]),
+      stateGroups.map((row) => [row.currentState, row._count._all]),
     ) as Partial<Record<OutreachSequenceState, number>>,
   };
 }
 
-export interface TodayOperationsFilters {
-  campaignId?: string;
-  stage?: OutreachSequenceState;
-  source?: string;
-  responseChannel?: AttributionChannel;
-  date?: string;
-}
-
-function responseEventFilter(
-  channel: AttributionChannel,
-): Prisma.OutreachEventWhereInput {
-  if (channel === "RVM_CALLBACK")
-    return {
-      channel: "RVM",
-      type: { in: ["RVM_CALLBACK", "OUTCOME_RECORDED"] },
-    };
-  if (channel === "SMS")
-    return {
-      channel: "SMS",
-      type: { in: ["SMS_REPLIED", "OUTCOME_RECORDED"] },
-    };
-  if (channel === "COLD_CALL")
-    return {
-      channel: "COLD_CALL",
-      type: {
-        in: ["COLD_CALL_CONTACTED", "COLD_CALL_NO_ANSWER", "OUTCOME_RECORDED"],
-      },
-    };
-  return { channel: "SYSTEM", type: "OUTCOME_RECORDED" };
+export interface TodayOperationsFilters extends AnalyticsFilters {
+  /** Compatibility name for the existing outreach filter UI. */
+  responseChannel?: AnalyticsAttributionChannel;
 }
 
 export async function getTodayOperations(filters: TodayOperationsFilters = {}) {
   const settings = await getAppSettings();
-  let at = new Date();
-  if (filters.date && /^\d{4}-\d{2}-\d{2}$/.test(filters.date)) {
-    const [year, month, day] = filters.date.split("-").map(Number);
-    at = zonedDateTimeToUtc(
-      { year, month, day, hour: 12, minute: 0 },
-      settings.operations_timezone,
-    );
-  }
-  const day = getLocalDayBounds(at, settings.operations_timezone);
-  const campaignContactFilters: Prisma.CampaignContactWhereInput[] = [];
-  if (filters.campaignId)
-    campaignContactFilters.push({ campaignId: filters.campaignId });
-  if (filters.source)
-    campaignContactFilters.push(campaignSpecificSourceFilter(filters.source));
-  const sequenceWhere: Prisma.OutreachSequenceWhereInput = {
-    ...(filters.stage ? { currentState: filters.stage } : {}),
-    ...(campaignContactFilters.length
-      ? { campaignContact: { AND: campaignContactFilters } }
-      : {}),
-    ...(filters.responseChannel
-      ? { events: { some: responseEventFilter(filters.responseChannel) } }
-      : {}),
+  const env = getEnv();
+  const referenceInstant = new Date();
+  const today = filters.date
+    ? analyticsDateRange(filters.date, settings.operations_timezone)
+    : (() => {
+        const range = getLocalDayBounds(
+          referenceInstant,
+          settings.operations_timezone,
+        );
+        return {
+          ...range,
+          storageDate: localDateStorageValue(
+            referenceInstant,
+            settings.operations_timezone,
+          ),
+        };
+      })();
+  const campaignPolicyGroups = filters.campaignId
+    ? await db.campaign.groupBy({
+        by: ["smsScheduleTimezone", "smsDailyCap"],
+        where: { id: filters.campaignId, kind: "SMS" },
+        _count: { _all: true },
+      })
+    : [];
+  const campaignPolicy = campaignPolicyGroups[0];
+  const campaignReference = filters.date
+    ? new Date((today.start.getTime() + today.end.getTime()) / 2)
+    : referenceInstant;
+  const campaignDay = campaignPolicy
+    ? getLocalDayBounds(campaignReference, campaignPolicy.smsScheduleTimezone)
+    : undefined;
+  const analyticsFilters: AnalyticsFilters = {
+    ...filters,
+    date: today.key,
+    creditedChannel: filters.creditedChannel ?? filters.responseChannel,
   };
-  const eventScope: Prisma.OutreachEventWhereInput = {
-    occurredAt: { gte: day.start, lt: day.end },
-    sequence: sequenceWhere,
-  };
-  const callbackWhere: Prisma.CallbackOutcomeWhereInput = {
-    callbackAt: { gte: day.start, lt: day.end },
-    ...(filters.campaignId ? { campaignId: filters.campaignId } : {}),
-    ...(filters.responseChannel
-      ? { attributionChannel: filters.responseChannel }
-      : {}),
-    ...(filters.source
-      ? { campaignContact: campaignSpecificSourceFilter(filters.source) }
-      : {}),
-  };
+  const cohort = buildAnalyticsCampaignContactWhere(analyticsFilters);
+  const dateFilter = { gte: today.start, lt: today.end };
+
   const [
+    metrics,
     scheduled,
-    processed,
-    smsEligibleToday,
-    smsAwaitingExport,
-    coldCallEligibleToday,
-    coldCallAwaitingExport,
-    callbacks,
-    qualifiedRows,
-    externalQualifiedEvents,
-    optOutEvents,
-    dailyUsage,
+    scheduledRemaining,
+    globalUsage,
+    campaignAttempted,
   ] = await Promise.all([
-    db.outreachSequence.count({
+    getCampaignMetrics(analyticsFilters),
+    db.smsOutboundMessage.count({
+      where: outboundMessageWhere(cohort, analyticsFilters, {
+        scheduledFor: dateFilter,
+      }),
+    }),
+    db.smsOutboundMessage.count({
+      where: outboundMessageWhere(cohort, analyticsFilters, {
+        scheduledFor: dateFilter,
+        usageLedger: { none: { kind: "ATTEMPT" } },
+      }),
+    }),
+    db.smsDailyUsage.aggregate({
       where: {
-        ...sequenceWhere,
-        rvmScheduledFor: { gte: day.start, lt: day.end },
+        localDate: today.storageDate,
+        timezone: settings.operations_timezone,
+      },
+      _sum: {
+        attemptedCount: true,
+        acceptedCount: true,
+        deliveredCount: true,
       },
     }),
-    db.outreachSequence.count({
-      where: {
-        ...sequenceWhere,
-        rvmAttemptedAt: { gte: day.start, lt: day.end },
-      },
-    }),
-    db.outreachEvent.count({
-      where: { ...eventScope, type: "SMS_ELIGIBLE" },
-    }),
-    db.outreachSequence.count({
-      where: { ...sequenceWhere, currentState: "SMS_ELIGIBLE" },
-    }),
-    db.outreachEvent.count({
-      where: { ...eventScope, type: "COLD_CALL_ELIGIBLE" },
-    }),
-    db.outreachSequence.count({
-      where: { ...sequenceWhere, currentState: "COLD_CALL_ELIGIBLE" },
-    }),
-    db.callbackOutcome.findMany({
-      where: {
-        ...callbackWhere,
-        campaignContactId: { not: null },
-        attributionChannel: filters.responseChannel ?? "RVM_CALLBACK",
-      },
-      select: { campaignContactId: true, normalizedPhone: true },
-    }),
-    db.callbackOutcome.findMany({
-      where: {
-        ...callbackWhere,
-        campaignContactId: { not: null },
-        outcome: { in: ["QUALIFIED_LEAD", "CONTRACT", "CLOSED"] },
-      },
-      select: { campaignContactId: true, normalizedPhone: true },
-    }),
-    db.outreachEvent.findMany({
-      where: {
-        ...eventScope,
-        channel: { in: ["SMS", "COLD_CALL"] },
-        source: "external_outcome_import",
-        type: { not: "SEQUENCE_EXITED" },
-        resultingState: { in: QUALIFIED_SEQUENCE_STATES },
-      },
-      select: {
-        sequence: { select: { campaignContactId: true } },
-      },
-    }),
-    db.outreachEvent.findMany({
-      where: { ...eventScope, resultingState: "OPT_OUT" },
-      select: { sequenceId: true },
-    }),
-    getDailyRvmUsage(at),
+    campaignDay && filters.campaignId
+      ? db.smsUsageLedger.count({
+          where: {
+            kind: "ATTEMPT",
+            occurredAt: { gte: campaignDay.start, lt: campaignDay.end },
+            message: {
+              is: {
+                campaignContact: {
+                  is: { campaignId: filters.campaignId },
+                },
+              },
+            },
+          },
+        })
+      : Promise.resolve(null),
   ]);
+
+  const globalDailyCap = effectiveGlobalDailySmsCap(
+    settings.daily_sms_cap,
+    env.MAX_LIVE_DAILY_SMS_LIMIT,
+  );
+  const globalAttempted = globalUsage._sum.attemptedCount ?? 0;
+  const campaignDailyCap = campaignPolicy?.smsDailyCap ?? null;
+
   return {
-    date: day.key,
+    date: today.key,
     timezone: settings.operations_timezone,
-    rvmScheduled: scheduled,
-    rvmProcessed: processed,
-    rvmRemaining: Math.max(0, scheduled - processed),
-    rvmAttempted: dailyUsage.attempted,
-    rvmSuccessful: dailyUsage.successful,
-    rvmAllowanceRemaining: dailyUsage.remaining,
-    operatingDailyCap: dailyUsage.operatingCap,
-    environmentDailyCap: dailyUsage.environmentCap,
-    smsEligibleToday,
-    smsAwaitingExport,
-    coldCallEligibleToday,
-    coldCallAwaitingExport,
-    callbacks: new Set(callbacks.map(outcomeIdentity)).size,
-    qualifiedLeads: new Set([
-      ...qualifiedRows.flatMap((outcome) =>
-        outcome.campaignContactId ? [outcome.campaignContactId] : [],
-      ),
-      ...externalQualifiedEvents.map(
-        (event) => event.sequence.campaignContactId,
-      ),
-    ]).size,
-    optOuts: new Set(optOutEvents.map((event) => event.sequenceId)).size,
+    smsScheduled: scheduled,
+    smsProcessed: metrics.attempted,
+    smsRemaining: scheduledRemaining,
+    smsQueued: metrics.queued,
+    smsAttempted: metrics.attempted,
+    smsAccepted: metrics.accepted,
+    smsSent: metrics.sent,
+    smsDelivered: metrics.delivered,
+    smsFailed: metrics.unsuccessful,
+    replies: metrics.replies,
+    optOuts: metrics.optOuts,
+    interested: metrics.interested,
+    qualifiedLeads: metrics.qualified,
+    nonresponders: metrics.nonresponders,
+    batchDialerEligible: metrics.batchDialerEligible,
+    batchDialerExported: metrics.batchDialerExported,
+    coldCallContacted: metrics.coldCallContacted,
+    coldCallQualifiedLeads: metrics.coldCallQualifiedLeads,
+    contracts: metrics.contracts,
+    closed: metrics.closed,
+    campaignDailyCap,
+    campaignCapTimezone: campaignPolicy?.smsScheduleTimezone ?? null,
+    campaignAttempted,
+    campaignAllowanceRemaining:
+      campaignDailyCap == null || campaignAttempted == null
+        ? null
+        : Math.max(0, campaignDailyCap - campaignAttempted),
+    configuredDailyCap: settings.daily_sms_cap,
+    environmentDailyCap: env.MAX_LIVE_DAILY_SMS_LIMIT,
+    liveSendsEnabled: env.SMS_LIVE_SENDS_ENABLED,
+    globalDailyCap,
+    globalAttempted,
+    globalAccepted: globalUsage._sum.acceptedCount ?? 0,
+    globalDelivered: globalUsage._sum.deliveredCount ?? 0,
+    globalAllowanceRemaining: Math.max(0, globalDailyCap - globalAttempted),
   };
 }

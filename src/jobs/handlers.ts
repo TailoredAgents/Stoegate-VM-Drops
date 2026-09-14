@@ -3,36 +3,36 @@ import type { Job } from "pg-boss";
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { getEnv } from "@/lib/env";
-import { getNumericSettings } from "@/lib/settings";
-import { assertLiveSendPreconditions } from "@/lib/live-send-guards";
+import { withSmsDispatchLock } from "@/lib/sms-dispatch-lock";
 import {
-  ensureOutreachSequence,
-  markRvmScheduled,
-  reconcileDueOutreach,
-  recordRvmSubmissionUncertainTx,
-} from "@/lib/outreach-service";
+  ensureSmsSequenceTx,
+  markSmsSuppressedBeforeSend,
+  reconcileSmsOutreach,
+  transitionSmsSequenceTx,
+} from "@/lib/sms-outreach";
 import {
-  reserveLiveRvmAttempt,
-  RvmAttemptDeferredError,
-} from "@/lib/rvm-operations";
-import { renderVoicemailTemplate } from "@/lib/templates";
+  persistDryRunSmsResult,
+  persistLiveSmsProviderResult,
+  persistSmsDeliveryStatus,
+  reserveLiveSmsAttempt,
+  SmsAttemptDeferredError,
+} from "@/lib/sms-operations";
+import { prepareSmsMessage } from "@/lib/sms";
+import {
+  reconcileSynchronousSmsProviderResults,
+  reconcileUnmatchedSmsStatusEvents,
+} from "@/lib/sms-webhooks";
 import { sha256 } from "@/lib/utils";
-import { getProviders } from "@/providers";
-import { enqueueGenerateAudio, enqueueSendDrop } from "./queues";
+import { getSmsProvider } from "@/providers";
+import { enqueuePrepareCampaign, enqueueSendSms } from "./queues";
 
 const prepareSchema = z.object({
   campaignId: z.uuid(),
   mode: z.enum(["preview", "bulk"]),
 });
-const audioSchema = z.object({
-  campaignId: z.uuid(),
-  campaignContactId: z.uuid(),
-  preview: z.boolean(),
-});
 const sendSchema = z.object({
   campaignId: z.uuid(),
-  campaignContactId: z.uuid(),
-  audioAssetId: z.uuid(),
+  messageId: z.uuid(),
 });
 
 async function recordJobStart(
@@ -72,104 +72,9 @@ async function recordJobFinish(job: Job<unknown>, error?: unknown) {
   });
 }
 
-export async function handlePrepareCampaign(job: Job<unknown>) {
-  const data = prepareSchema.parse(job.data);
-  await recordJobStart(job, data.campaignId);
-  try {
-    const campaign = await db.campaign.findUniqueOrThrow({
-      where: { id: data.campaignId },
-    });
-    if (data.mode === "preview") {
-      if (
-        !["DATA_READY", "PREVIEW_READY", "APPROVED"].includes(campaign.status)
-      ) {
-        await recordJobFinish(job);
-        return;
-      }
-      await db.campaign.update({
-        where: { id: campaign.id },
-        data: { status: "PREVIEW_GENERATING" },
-      });
-      await db.campaignContact.updateMany({
-        where: { campaignId: campaign.id },
-        data: { isPreview: false },
-      });
-      const sampleSize = Math.min(
-        getEnv().PREVIEW_SAMPLE_SIZE,
-        campaign.eligibleCount,
-      );
-      const sample = await db.$queryRaw<Array<{ id: string }>>`
-        SELECT id FROM "CampaignContact"
-        WHERE "campaignId" = ${campaign.id}::uuid AND status IN ('ELIGIBLE', 'AUDIO_READY')
-        ORDER BY random() LIMIT ${sampleSize}
-      `;
-      await db.campaignContact.updateMany({
-        where: { id: { in: sample.map((row) => row.id) } },
-        data: { isPreview: true },
-      });
-      for (const row of sample)
-        await enqueueGenerateAudio(campaign.id, row.id, true);
-      if (sample.length === 0)
-        await db.campaign.update({
-          where: { id: campaign.id },
-          data: { status: "FAILED" },
-        });
-    } else {
-      if (!["QUEUED", "SENDING"].includes(campaign.status)) {
-        await recordJobFinish(job);
-        return;
-      }
-      await db.campaign.update({
-        where: { id: campaign.id },
-        data: { status: "SENDING" },
-      });
-      const unfinished = await db.campaignContact.findMany({
-        where: {
-          campaignId: campaign.id,
-          selectedForSend: true,
-          status: { in: ["AUDIO_PENDING", "AUDIO_READY"] },
-        },
-        select: { id: true },
-      });
-      const alreadySelected = await db.campaignContact.count({
-        where: { campaignId: campaign.id, selectedForSend: true },
-      });
-      const remaining = Math.max(0, campaign.sendLimit - alreadySelected);
-      const contacts = await db.campaignContact.findMany({
-        where: {
-          campaignId: campaign.id,
-          selectedForSend: false,
-          status: { in: ["ELIGIBLE", "AUDIO_READY"] },
-        },
-        orderBy: { createdAt: "asc" },
-        take: remaining,
-        select: { id: true },
-      });
-      if (contacts.length) {
-        await db.campaignContact.updateMany({
-          where: { id: { in: contacts.map((contact) => contact.id) } },
-          data: { selectedForSend: true, status: "AUDIO_PENDING" },
-        });
-      }
-      for (const contact of [...unfinished, ...contacts])
-        await enqueueGenerateAudio(campaign.id, contact.id, false);
-      await markRvmScheduled(
-        [...unfinished, ...contacts].map((contact) => contact.id),
-      );
-      if (unfinished.length + contacts.length === 0)
-        await maybeCompleteCampaign(campaign.id);
-    }
-    await recordJobFinish(job);
-  } catch (error) {
-    await recordJobFinish(job, error);
-    throw error;
-  }
-}
-
 function templateContext(cc: {
   contact: {
     firstName: string | null;
-    lastName: string | null;
     ownerName: string | null;
   };
   property: {
@@ -177,454 +82,515 @@ function templateContext(cc: {
     streetName: string | null;
     city: string | null;
     state: string | null;
-    postalCode: string | null;
     county: string | null;
     acreage: Prisma.Decimal | null;
     propertyType: string | null;
   } | null;
 }) {
   return {
-    first_name: cc.contact.firstName ?? "",
-    last_name: cc.contact.lastName ?? "",
-    owner_name: cc.contact.ownerName ?? "",
-    property_address: cc.property?.propertyAddress ?? "",
-    street_name: cc.property?.streetName ?? "",
-    city: cc.property?.city ?? "",
-    state: cc.property?.state ?? "",
-    postal_code: cc.property?.postalCode ?? "",
-    county: cc.property?.county ?? "",
-    acreage: cc.property?.acreage?.toString() ?? "",
-    property_type: cc.property?.propertyType ?? "",
+    first_name: cc.contact.firstName,
+    owner_name: cc.contact.ownerName,
+    property_address: cc.property?.propertyAddress,
+    street_name: cc.property?.streetName,
+    city: cc.property?.city,
+    state: cc.property?.state,
+    county: cc.property?.county,
+    acreage: cc.property?.acreage?.toString(),
+    property_type: cc.property?.propertyType,
   };
 }
 
-export async function handleGenerateAudio(job: Job<unknown>) {
-  const data = audioSchema.parse(job.data);
-  await recordJobStart(job, data.campaignId, data.campaignContactId);
-  try {
-    const cc = await db.campaignContact.findUniqueOrThrow({
-      where: { id: data.campaignContactId },
-      include: {
-        contact: true,
-        property: true,
-        campaign: {
-          include: { scriptTemplateVersion: true, voiceConfiguration: true },
-        },
-      },
+function recordValue(value: Prisma.JsonValue | null) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, Prisma.JsonValue>)
+    : {};
+}
+
+function nonNegativeNumber(value: Prisma.JsonValue | undefined) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, value)
+    : 0;
+}
+
+function campaignCost(campaign: {
+  smsCostConfig: Prisma.JsonValue | null;
+  smsEstimatedCostPerSegmentMicros: number;
+}) {
+  const config = recordValue(campaign.smsCostConfig);
+  return {
+    costPerSegmentCents:
+      nonNegativeNumber(config.costPerSegmentMicros) / 10_000 ||
+      campaign.smsEstimatedCostPerSegmentMicros / 10_000,
+    fixedCostPerMessageCents:
+      nonNegativeNumber(config.costPerOutboundMessageMicros) / 10_000,
+  };
+}
+
+async function generatePreview(campaignId: string) {
+  const campaign = await db.campaign.findUniqueOrThrow({
+    where: { id: campaignId },
+    include: { smsTemplateVersion: true },
+  });
+  if (
+    campaign.kind !== "SMS" ||
+    !["DATA_READY", "PREVIEW_READY", "APPROVED"].includes(campaign.status)
+  )
+    return;
+  if (!campaign.smsTemplateVersion)
+    throw new Error("Campaign has no SMS template version");
+  await db.campaign.update({
+    where: { id: campaign.id },
+    data: { status: "PREVIEW_GENERATING" },
+  });
+  await db.campaignContact.updateMany({
+    where: { campaignId: campaign.id },
+    data: { isPreview: false },
+  });
+  const sampleSize = Math.min(
+    getEnv().PREVIEW_SAMPLE_SIZE,
+    campaign.eligibleCount,
+  );
+  const sample = await db.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "CampaignContact"
+    WHERE "campaignId" = ${campaign.id}::uuid
+      AND "status" IN ('ELIGIBLE', 'PREVIEW_READY')
+    ORDER BY random()
+    LIMIT ${sampleSize}
+  `;
+  const contacts = await db.campaignContact.findMany({
+    where: { id: { in: sample.map((row) => row.id) } },
+    include: { contact: true, property: true },
+  });
+  if (!contacts.length) {
+    await db.campaign.update({
+      where: { id: campaign.id },
+      data: { status: "FAILED" },
     });
-    if (cc.campaign.status === "PAUSED" || cc.campaign.status === "FAILED") {
-      await recordJobFinish(job);
-      return;
-    }
-    const script = cc.campaign.scriptTemplateVersion;
-    const voice = cc.campaign.voiceConfiguration;
-    if (!script || !voice)
-      throw new Error("Campaign script and voice must be configured");
-    const renderedText = renderVoicemailTemplate(
-      script.body,
-      templateContext(cc),
-    );
-    const voiceSettings =
-      voice.settings && typeof voice.settings === "object"
-        ? (voice.settings as Record<string, unknown>)
-        : undefined;
-    const textHash = sha256(
-      `${renderedText}\0${voice.voiceId}\0${voice.modelId}\0${getEnv().ELEVENLABS_OUTPUT_FORMAT}\0${JSON.stringify(voiceSettings ?? {})}`,
-    );
-    const existing = await db.audioAsset.findUnique({
+    return;
+  }
+  await db.$transaction(
+    contacts.map((contact) => {
+      const prepared = prepareSmsMessage(
+        campaign.smsTemplateVersion!.body,
+        templateContext(contact),
+        campaignCost(campaign),
+      );
+      return db.campaignContact.update({
+        where: { id: contact.id },
+        data: {
+          isPreview: true,
+          status: "PREVIEW_READY",
+          renderedText: prepared.body,
+          errorCode: null,
+          errorMessage: null,
+        },
+      });
+    }),
+  );
+  await db.campaign.update({
+    where: { id: campaign.id },
+    data: { status: "PREVIEW_READY" },
+  });
+}
+
+async function prepareBulk(campaignId: string) {
+  const campaign = await db.campaign.findUniqueOrThrow({
+    where: { id: campaignId },
+    include: { smsTemplateVersion: true },
+  });
+  if (
+    campaign.kind !== "SMS" ||
+    !["QUEUED", "SENDING"].includes(campaign.status)
+  )
+    return;
+  if (!campaign.smsTemplateVersion)
+    throw new Error("Campaign has no SMS template version");
+  await db.campaign.update({
+    where: { id: campaign.id },
+    data: { status: "SENDING", pausedAt: null },
+  });
+
+  const alreadySelected = await db.campaignContact.count({
+    where: { campaignId, selectedForSend: true },
+  });
+  const remaining = Math.max(0, campaign.sendLimit - alreadySelected);
+  if (remaining > 0) {
+    const next = await db.campaignContact.findMany({
       where: {
-        campaignContactId_textHash_voiceId_modelId: {
-          campaignContactId: cc.id,
-          textHash,
-          voiceId: voice.voiceId,
-          modelId: voice.modelId,
-        },
+        campaignId,
+        selectedForSend: false,
+        status: { in: ["ELIGIBLE", "PREVIEW_READY"] },
       },
+      orderBy: { createdAt: "asc" },
+      take: remaining,
+      select: { id: true },
     });
-    const needsLiveAudio = getEnv().AUDIO_GENERATION_LIVE_ENABLED;
-    const storedLiveGeneration =
-      existing?.status === "READY" && needsLiveAudio
-        ? await db.audioGenerationUsage.findFirst({
-            where: {
-              audioAssetId: existing.id,
-              billingDisposition: "BILLABLE_GENERATION",
-              storedAt: { not: null },
-              storageError: null,
+    if (next.length)
+      await db.campaignContact.updateMany({
+        where: { id: { in: next.map((row) => row.id) } },
+        data: { selectedForSend: true },
+      });
+  }
+
+  const contacts = await db.campaignContact.findMany({
+    where: { campaignId, selectedForSend: true },
+    include: {
+      contact: true,
+      property: true,
+      outreachSequence: true,
+      outboundMessages: { where: { sequenceNumber: 1 }, take: 1 },
+      consentEvidence: {
+        where: { status: "VERIFIED" },
+        orderBy: { capturedAt: "desc" },
+        take: 1,
+      },
+    },
+  });
+  const startAt = campaign.smsScheduledFor ?? new Date();
+  for (const contact of contacts) {
+    let messageId = contact.outboundMessages[0]?.id;
+    if (!messageId) {
+      const prepared = prepareSmsMessage(
+        campaign.smsTemplateVersion.body,
+        templateContext(contact),
+        campaignCost(campaign),
+      );
+      const estimatedCostMicros = Math.round(
+        (prepared.estimatedProviderCost?.estimatedProviderCostCents ?? 0) *
+          10_000,
+      );
+      const message = await db.$transaction(async (tx) => {
+        const sequence = await ensureSmsSequenceTx(
+          tx,
+          contact.id,
+          campaign.smsColdCallDelayHours,
+        );
+        const conversation = await tx.smsConversation.upsert({
+          where: { campaignContactId: contact.id },
+          create: {
+            campaignContactId: contact.id,
+            providerKey: campaign.smsProviderKey ?? getEnv().SMS_PROVIDER,
+          },
+          update: {},
+        });
+        const created = await tx.smsOutboundMessage.upsert({
+          where: {
+            campaignContactId_sequenceNumber: {
+              campaignContactId: contact.id,
+              sequenceNumber: 1,
             },
-            select: { id: true },
-          })
-        : null;
-    const canReuse =
-      existing?.status === "READY" &&
-      (!needsLiveAudio ||
-        (existing.billingDisposition === "BILLABLE_GENERATION" &&
-          Boolean(storedLiveGeneration)));
-    if (canReuse && existing) {
-      await db.audioAsset.update({
-        where: { id: existing.id },
-        data: { reuseCount: { increment: 1 } },
+          },
+          create: {
+            campaignContactId: contact.id,
+            sequenceId: sequence.id,
+            conversationId: conversation.id,
+            templateVersionId: campaign.smsTemplateVersion!.id,
+            consentEvidenceId: contact.consentEvidence[0]?.id,
+            sequenceNumber: 1,
+            idempotencyKey: `sms:${campaign.id}:${contact.id}:1`,
+            toPhone: contact.contact.normalizedPhone,
+            fromPhone: campaign.smsSenderRef,
+            renderedBody: prepared.body,
+            bodyHash: sha256(prepared.body),
+            segmentCount: prepared.segments.segmentCount,
+            providerKey: campaign.smsProviderKey ?? getEnv().SMS_PROVIDER,
+            status: "QUEUED",
+            estimatedCostMicros,
+            currency: campaign.smsCurrency,
+            scheduledFor: startAt,
+            queuedAt: new Date(),
+            complianceSnapshot: {
+              campaignComplianceStatus: campaign.smsComplianceStatus,
+              campaignComplianceNotes: campaign.smsComplianceNotes,
+              templateVersionId: campaign.smsTemplateVersion!.id,
+              templateContentHash: campaign.smsTemplateVersion!.contentHash,
+              consentEvidenceId: contact.consentEvidence[0]?.id ?? null,
+              timezone: campaign.smsScheduleTimezone,
+              sendWindowStartMinutes: campaign.smsSendWindowStartMinutes,
+              sendWindowEndMinutes: campaign.smsSendWindowEndMinutes,
+            },
+          },
+          update: {},
+        });
+        await tx.campaignContact.update({
+          where: { id: contact.id },
+          data: {
+            status: "QUEUED",
+            renderedText: prepared.body,
+            errorCode: null,
+            errorMessage: null,
+          },
+        });
+        await transitionSmsSequenceTx(tx, {
+          sequenceId: sequence.id,
+          type: "SMS_QUEUED",
+          resultingState: "SMS_QUEUED",
+          idempotencyKey: `sms:${created.id}:queued`,
+          source: "sms_campaign_worker",
+          occurredAt: created.queuedAt ?? new Date(),
+          projection: {
+            smsScheduledFor: startAt,
+            smsToColdCallDelayHours: campaign.smsColdCallDelayHours,
+            nextEligibleAt: startAt,
+          },
+        });
+        return created;
       });
-      if (!data.preview)
-        await enqueueSendDrop(data.campaignId, cc.id, existing.id);
-      await finalizePreview(data.campaignId);
-      await recordJobFinish(job);
-      return;
+      messageId = message.id;
     }
-    const asset =
-      existing ??
-      (await db.audioAsset.create({
-        data: {
-          campaignContactId: cc.id,
-          scriptTemplateVersionId: script.id,
-          voiceConfigurationId: voice.id,
-          renderedText,
-          textHash,
-          voiceId: voice.voiceId,
-          modelId: voice.modelId,
-          characterCount: renderedText.length,
-        },
-      }));
-    await db.audioAsset.update({
-      where: { id: asset.id },
-      data: { status: "GENERATING", errorMessage: null },
+    const existing = await db.smsOutboundMessage.findUnique({
+      where: { id: messageId },
+      select: { status: true, scheduledFor: true },
     });
-    const { tts, storage } = getProviders();
-    const generated = await tts.generate({
-      text: renderedText,
-      voiceId: voice.voiceId,
-      modelId: voice.modelId,
-      settings: voiceSettings,
-    });
-    const settings = await getNumericSettings();
-    const billableGeneration = tts.name !== "dry-run-tts";
-    const estimatedCostCents = billableGeneration
-      ? Math.round(
-          (generated.characterCount / 1000) *
-            settings.elevenlabs_cost_per_1000_chars_cents,
-        )
-      : 0;
-    const generatedAt = new Date();
-    const usage = await db.audioGenerationUsage.create({
-      data: {
-        audioAssetId: asset.id,
-        provider: tts.name,
-        providerGenerationId: generated.providerGenerationId,
-        characterCount: generated.characterCount,
-        estimatedCostCents,
-        billingDisposition: billableGeneration
-          ? "BILLABLE_GENERATION"
-          : "DRY_RUN",
-        generatedAt,
-      },
-    });
-    const extension = generated.contentType.includes("wav") ? "wav" : "mp3";
-    const objectKey = `campaigns/${cc.campaignId}/contacts/${cc.id}/${textHash}.${extension}`;
-    try {
-      await storage.put({
-        key: objectKey,
-        bytes: generated.bytes,
-        contentType: generated.contentType,
-      });
-      await db.audioGenerationUsage.update({
-        where: { id: usage.id },
-        data: { storedAt: new Date() },
-      });
-    } catch (error) {
-      await db.audioGenerationUsage.update({
-        where: { id: usage.id },
-        data: {
-          storageError: error instanceof Error ? error.message : String(error),
-        },
-      });
-      throw error;
-    }
-    const ready = await db.audioAsset.update({
-      where: { id: asset.id },
-      data: {
-        status: "READY",
-        objectKey,
-        contentType: generated.contentType,
-        characterCount: generated.characterCount,
-        providerGenerationId: generated.providerGenerationId,
-        durationSeconds: generated.durationSeconds,
-        estimatedCostCents,
-        billingDisposition: billableGeneration
-          ? "BILLABLE_GENERATION"
-          : "DRY_RUN",
-        generatedAt,
-      },
-    });
-    await db.campaignContact.update({
-      where: { id: cc.id },
-      data: { status: "AUDIO_READY", renderedText },
-    });
-    if (data.preview) await finalizePreview(data.campaignId);
-    else await enqueueSendDrop(data.campaignId, cc.id, ready.id);
+    if (
+      existing &&
+      ["PENDING", "SCHEDULED", "QUEUED"].includes(existing.status)
+    )
+      await enqueueSendSms(
+        campaign.id,
+        messageId,
+        existing.scheduledFor && existing.scheduledFor > new Date()
+          ? existing.scheduledFor
+          : undefined,
+      );
+  }
+  if (!contacts.length) await maybeCompleteCampaign(campaign.id);
+}
+
+export async function handlePrepareCampaign(job: Job<unknown>) {
+  const data = prepareSchema.parse(job.data);
+  await recordJobStart(job, data.campaignId);
+  try {
+    if (data.mode === "preview") await generatePreview(data.campaignId);
+    else await prepareBulk(data.campaignId);
     await recordJobFinish(job);
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    await db.audioAsset.updateMany({
-      where: {
-        campaignContactId: data.campaignContactId,
-        status: "GENERATING",
-      },
-      data: { status: "FAILED", errorMessage },
-    });
-    await db.campaignContact.updateMany({
-      where: { id: data.campaignContactId },
-      data: {
-        status: "FAILED",
-        errorMessage,
-      },
-    });
     await recordJobFinish(job, error);
     throw error;
   }
 }
 
-async function finalizePreview(campaignId: string) {
-  const [selected, ready] = await Promise.all([
-    db.campaignContact.count({ where: { campaignId, isPreview: true } }),
-    db.campaignContact.count({
-      where: {
-        campaignId,
-        isPreview: true,
-        audioAssets: { some: { status: "READY" } },
+async function blockedBeforeSend(messageId: string) {
+  const message = await db.smsOutboundMessage.findUniqueOrThrow({
+    where: { id: messageId },
+    include: {
+      campaignContact: {
+        include: {
+          contact: { include: { suppressions: { take: 1 } } },
+          campaign: true,
+          inboundMessages: { take: 1, select: { id: true } },
+          leadAttribution: { select: { id: true } },
+        },
       },
-    }),
-  ]);
-  if (selected > 0 && selected === ready) {
-    await db.campaign.updateMany({
-      where: { id: campaignId, status: "PREVIEW_GENERATING" },
-      data: { status: "PREVIEW_READY" },
-    });
-  }
+    },
+  });
+  const campaignSuppression = await db.campaignSuppression.findUnique({
+    where: {
+      campaignId_normalizedPhone: {
+        campaignId: message.campaignContact.campaignId,
+        normalizedPhone: message.toPhone,
+      },
+    },
+    select: { id: true },
+  });
+  if (message.campaignContact.contact.suppressions.length)
+    return "Globally suppressed before send";
+  if (campaignSuppression) return "Suppressed for this campaign before send";
+  if (message.campaignContact.inboundMessages.length)
+    return "A reply already exists for this campaign contact";
+  if (message.campaignContact.leadAttribution)
+    return "This campaign contact is already a qualified lead";
+  return null;
 }
 
-export async function handleSendDrop(job: Job<unknown>) {
+export async function handleSendSms(job: Job<unknown>) {
   const data = sendSchema.parse(job.data);
-  let committedLiveReservation:
-    { dropId: string; campaignContactId: string } | undefined;
-  let providerResultPersisted = false;
-  await recordJobStart(job, data.campaignId, data.campaignContactId);
+  await recordJobStart(job, data.campaignId, data.messageId);
+  let liveAttemptId: string | undefined;
   try {
-    const cc = await db.campaignContact.findUniqueOrThrow({
-      where: { id: data.campaignContactId },
-      include: { campaign: true, contact: true, property: true },
+    const message = await db.smsOutboundMessage.findUniqueOrThrow({
+      where: { id: data.messageId },
+      include: { campaignContact: { include: { campaign: true } } },
     });
-    if (cc.campaign.status === "PAUSED") {
-      await db.campaignContact.update({
-        where: { id: cc.id },
-        data: { status: "AUDIO_READY" },
-      });
+    const campaign = message.campaignContact.campaign;
+    if (campaign.status === "PAUSED" || campaign.status === "SCHEDULED") {
       await recordJobFinish(job);
       return;
     }
-    if (cc.campaign.status !== "SENDING")
-      throw new Error(`Campaign is not sendable (${cc.campaign.status})`);
-    const suppression = await db.suppressionEntry.findUnique({
-      where: { normalizedPhone: cc.contact.normalizedPhone },
-    });
-    if (suppression) {
-      await db.campaignContact.update({
-        where: { id: cc.id },
-        data: {
-          status: "SKIPPED",
-          errorCode: "SUPPRESSED",
-          errorMessage: "Suppressed before send",
-        },
-      });
-      await maybeCompleteCampaign(data.campaignId);
+    if (campaign.kind !== "SMS" || campaign.status !== "SENDING")
+      throw new Error(`SMS campaign is not sendable (${campaign.status})`);
+    if (!["PENDING", "SCHEDULED", "QUEUED"].includes(message.status)) {
       await recordJobFinish(job);
       return;
     }
-    const audio = await db.audioAsset.findUniqueOrThrow({
-      where: { id: data.audioAssetId },
-    });
-    if (audio.status !== "READY" || !audio.objectKey)
-      throw new Error("Audio is not ready");
-    let drop = await db.drop.findUnique({
-      where: {
-        campaignContactId_provider: {
-          campaignContactId: cc.id,
-          provider: "dropcowboy",
-        },
-      },
-    });
-    if (
-      drop &&
-      (drop.queuedAt ||
-        ["DRY_RUN", "QUEUED", "SENT", "DELIVERED", "OPTED_OUT"].includes(
-          drop.status,
-        ))
-    ) {
+    const blocked = await blockedBeforeSend(message.id);
+    if (blocked) {
+      await markSmsSuppressedBeforeSend({
+        messageId: message.id,
+        reason: blocked,
+      });
+      await maybeCompleteCampaign(campaign.id);
       await recordJobFinish(job);
       return;
     }
-    drop ??= await db.drop.create({
-      data: { campaignContactId: cc.id, audioAssetId: audio.id },
-    });
-    await ensureOutreachSequence(cc.id);
-    await db.campaignContact.update({
-      where: { id: cc.id },
-      data: { status: "SENDING", errorCode: null, errorMessage: null },
-    });
-    const { storage, rvm } = getProviders();
-    const audioUrl = await storage.getReadUrl(audio.objectKey);
-    const callbackUrl = new URL(
-      "/api/webhooks/dropcowboy",
-      getEnv().APP_BASE_URL,
-    ).toString();
-    await assertLiveSendPreconditions({
-      campaign: cc.campaign,
-      campaignContact: {
-        id: cc.id,
-        selectedForSend: cc.selectedForSend,
-        normalizedPhone: cc.contact.normalizedPhone,
-      },
-      audio,
-      drop,
-      callbackUrl,
-      rvm,
-    });
-    if (rvm.live) {
-      try {
-        const reservation = await reserveLiveRvmAttempt({
-          dropId: drop.id,
-          campaignContactId: cc.id,
-          audioAssetId: audio.id,
-        });
-        if (!reservation.reserved) {
-          await recordJobFinish(job);
-          return;
-        }
-        committedLiveReservation = {
-          dropId: drop.id,
-          campaignContactId: cc.id,
-        };
-      } catch (error) {
-        if (error instanceof RvmAttemptDeferredError) {
-          await db.campaignContact.update({
-            where: { id: cc.id },
-            data: { status: "AUDIO_READY" },
-          });
-          await enqueueSendDrop(
-            data.campaignId,
-            cc.id,
-            audio.id,
-            error.nextAllowedAt,
-          );
-          await recordJobFinish(job);
-          return;
-        }
-        throw error;
-      }
-    }
-    const result = await rvm.send({
-      foreignId: drop.id,
-      phoneNumber: cc.contact.normalizedPhone,
-      media: {
-        strategy: "hosted_url",
-        url: audioUrl,
-        audioType: audio.contentType.toLowerCase().includes("wav")
-          ? "wav"
-          : "mp3",
-      },
-      postalCode: cc.property?.postalCode ?? undefined,
-      callbackUrl,
-    });
-    await db.$transaction(async (tx) => {
-      const persisted = await tx.drop.updateMany({
-        where: {
-          id: drop.id,
-          status: {
-            notIn: ["DELIVERED", "FAILED", "OPTED_OUT", "SKIPPED"],
-          },
+
+    const provider = getSmsProvider();
+    if (provider.live) {
+      await provider.assertReadyForLiveSend();
+      let stopAfterDispatchLock = false;
+      await withSmsDispatchLock(
+        {
+          campaignId: campaign.id,
+          normalizedPhone: message.toPhone,
         },
-        data: {
-          status:
-            result.status === "dry_run"
-              ? "DRY_RUN"
-              : result.status === "sent"
-                ? "SENT"
-                : "QUEUED",
-          providerMessageId: result.providerMessageId,
-          providerResponse: result.rawResponse as Prisma.InputJsonValue,
-          estimatedCostCents: 0,
-          queuedAt: rvm.live ? undefined : (drop.queuedAt ?? new Date()),
-          sentAt: result.status === "sent" ? new Date() : undefined,
+        async () => {
+          try {
+            let reservation;
+            try {
+              reservation = await reserveLiveSmsAttempt({
+                messageId: message.id,
+                occurredAt: new Date(),
+              });
+            } catch (error) {
+              if (error instanceof SmsAttemptDeferredError) {
+                await enqueueSendSms(
+                  campaign.id,
+                  message.id,
+                  error.nextAllowedAt,
+                );
+                await recordJobFinish(job);
+                stopAfterDispatchLock = true;
+                return;
+              }
+              throw error;
+            }
+            if (!reservation.reserved) {
+              await recordJobFinish(job);
+              stopAfterDispatchLock = true;
+              return;
+            }
+            liveAttemptId = reservation.attemptId;
+            const result = await provider.send({
+              idempotencyKey: reservation.idempotencyKey,
+              to: reservation.message.toPhone,
+              from: reservation.message.fromPhone,
+              body: reservation.message.renderedBody,
+              clientReference: reservation.message.id,
+              callbackUrl: new URL(
+                "/api/webhooks/sms",
+                getEnv().APP_BASE_URL,
+              ).toString(),
+              metadata: {
+                campaignId: campaign.id,
+                campaignContactId: message.campaignContactId,
+              },
+            });
+            const providerResultAt = new Date();
+            const synchronousDeliveryOutcome =
+              result.status === "sent"
+                ? ("SENT" as const)
+                : result.status === "delivered"
+                  ? ("DELIVERED" as const)
+                  : result.status === "undelivered"
+                    ? ("UNDELIVERED" as const)
+                    : null;
+            await persistLiveSmsProviderResult({
+              messageId: message.id,
+              attemptId: reservation.attemptId,
+              providerKey: reservation.providerKey,
+              outcome: [
+                "accepted",
+                "queued",
+                "sent",
+                "delivered",
+                "undelivered",
+              ].includes(result.status)
+                ? "ACCEPTED"
+                : ["rejected", "failed"].includes(result.status)
+                  ? "REJECTED"
+                  : "UNKNOWN",
+              providerMessageId: result.providerMessageId,
+              providerStatus: result.status,
+              providerResponse: result.rawResponse,
+              actualSegmentCount: result.segments,
+              actualCostMicros: result.costMicros,
+              errorCode: result.failureCode,
+              errorMessage: result.failureReason,
+              occurredAt: providerResultAt,
+            });
+            if (synchronousDeliveryOutcome) {
+              if (!result.providerMessageId)
+                throw new Error(
+                  `Provider returned ${result.status} without a provider message ID`,
+                );
+              await persistSmsDeliveryStatus({
+                messageId: message.id,
+                providerKey: reservation.providerKey,
+                providerEventId: `send-result:${reservation.attemptId}:${result.status}`,
+                providerMessageId: result.providerMessageId,
+                providerStatus: result.status,
+                outcome: synchronousDeliveryOutcome,
+                rawPayload: result.rawResponse,
+                actualSegmentCount: result.segments,
+                actualCostMicros: result.costMicros,
+                errorCode: result.failureCode,
+                errorMessage: result.failureReason,
+                occurredAt: providerResultAt,
+                receivedAt: providerResultAt,
+              });
+            }
+            liveAttemptId = undefined;
+          } catch (error) {
+            if (liveAttemptId) {
+              await persistLiveSmsProviderResult({
+                messageId: data.messageId,
+                attemptId: liveAttemptId,
+                outcome: "UNKNOWN",
+                providerStatus: "submission_unknown",
+                errorCode: "PROVIDER_SUBMISSION_UNKNOWN",
+                errorMessage:
+                  error instanceof Error ? error.message : String(error),
+                occurredAt: new Date(),
+              });
+              liveAttemptId = undefined;
+            }
+            throw error;
+          }
+        },
+      );
+      if (stopAfterDispatchLock) return;
+    } else {
+      const result = await provider.send({
+        idempotencyKey: message.idempotencyKey,
+        to: message.toPhone,
+        from: message.fromPhone ?? undefined,
+        body: message.renderedBody,
+        clientReference: message.id,
+        metadata: {
+          campaignId: campaign.id,
+          campaignContactId: message.campaignContactId,
         },
       });
-      if (persisted.count > 0) {
-        await tx.campaignContact.updateMany({
-          where: {
-            id: cc.id,
-            status: { in: ["SENDING", "QUEUED"] },
-          },
-          data: {
-            status: result.status === "dry_run" ? "SKIPPED" : "QUEUED",
-          },
-        });
-      }
-    });
-    providerResultPersisted = true;
-    await maybeCompleteCampaign(data.campaignId);
+      await persistDryRunSmsResult({
+        messageId: message.id,
+        providerMessageId: result.providerMessageId,
+        providerResponse: result.rawResponse,
+        requestFingerprint: result.requestFingerprint,
+        occurredAt: new Date(),
+      });
+    }
+    await maybeCompleteCampaign(campaign.id);
     await recordJobFinish(job);
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const failedAt = new Date();
-    const committed = committedLiveReservation;
-    if (committed && !providerResultPersisted) {
-      await db.$transaction(async (tx) => {
-        const failedDrop = await tx.drop.updateMany({
-          where: {
-            id: committed.dropId,
-            status: {
-              notIn: ["DELIVERED", "FAILED", "OPTED_OUT", "SKIPPED"],
-            },
-          },
-          data: {
-            status: "FAILED",
-            failedAt,
-            errorCode: "RVM_SUBMISSION_UNKNOWN",
-            errorMessage,
-          },
-        });
-        if (failedDrop.count > 0) {
-          await tx.campaignContact.updateMany({
-            where: {
-              id: committed.campaignContactId,
-              status: { in: ["SENDING", "QUEUED"] },
-            },
-            data: {
-              status: "FAILED",
-              errorCode: "RVM_SUBMISSION_UNKNOWN",
-              errorMessage,
-            },
-          });
-        }
-        await recordRvmSubmissionUncertainTx(tx, {
-          campaignContactId: committed.campaignContactId,
-          occurredAt: failedAt,
-          idempotencyKey: `drop:${committed.dropId}:submission-unknown`,
-          errorMessage,
-        });
-      });
-    } else if (!providerResultPersisted) {
-      await db.campaignContact.updateMany({
-        where: { id: data.campaignContactId },
-        data: {
-          status: "FAILED",
-          errorMessage,
-        },
-      });
-      await db.drop.updateMany({
-        where: { campaignContactId: data.campaignContactId, queuedAt: null },
-        data: {
-          status: "FAILED",
-          failedAt,
-          errorMessage,
-        },
+    if (liveAttemptId) {
+      await persistLiveSmsProviderResult({
+        messageId: data.messageId,
+        attemptId: liveAttemptId,
+        outcome: "UNKNOWN",
+        providerStatus: "submission_unknown",
+        errorCode: "PROVIDER_SUBMISSION_UNKNOWN",
+        errorMessage: error instanceof Error ? error.message : String(error),
+        occurredAt: new Date(),
       });
     }
     await recordJobFinish(job, error);
@@ -635,9 +601,43 @@ export async function handleSendDrop(job: Job<unknown>) {
 export async function handleReconcileOutreach(job: Job<unknown>) {
   await recordJobStart(job);
   try {
+    const now = new Date();
+    await reconcileSynchronousSmsProviderResults(100);
+    await reconcileUnmatchedSmsStatusEvents(100);
+    const dueCampaigns = await db.campaign.findMany({
+      where: {
+        kind: "SMS",
+        OR: [
+          { status: "SCHEDULED", smsScheduledFor: { lte: now } },
+          { status: "QUEUED" },
+        ],
+      },
+      select: { id: true, status: true },
+      take: 100,
+    });
+    for (const campaign of dueCampaigns) {
+      if (campaign.status === "SCHEDULED")
+        await db.campaign.updateMany({
+          where: { id: campaign.id, status: "SCHEDULED" },
+          data: { status: "QUEUED" },
+        });
+      await enqueuePrepareCampaign(campaign.id, "bulk");
+    }
+    const queuedMessages = await db.smsOutboundMessage.findMany({
+      where: {
+        status: { in: ["PENDING", "SCHEDULED", "QUEUED"] },
+        scheduledFor: { lte: now },
+        campaignContact: { campaign: { status: "SENDING", kind: "SMS" } },
+      },
+      select: { id: true, campaignContact: { select: { campaignId: true } } },
+      take: 500,
+    });
+    for (const message of queuedMessages)
+      await enqueueSendSms(message.campaignContact.campaignId, message.id);
+
     let examined = 0;
     do {
-      const result = await reconcileDueOutreach(new Date(), 500);
+      const result = await reconcileSmsOutreach(now, 500);
       examined = result.examined;
     } while (examined === 500);
     await recordJobFinish(job);
@@ -650,14 +650,13 @@ export async function handleReconcileOutreach(job: Job<unknown>) {
 export async function maybeCompleteCampaign(campaignId: string) {
   const campaign = await db.campaign.findUnique({
     where: { id: campaignId },
-    select: { status: true, sendLimit: true },
+    select: { status: true },
   });
   if (!campaign || campaign.status !== "SENDING") return;
-  const active = await db.campaignContact.count({
+  const active = await db.smsOutboundMessage.count({
     where: {
-      campaignId,
-      selectedForSend: true,
-      status: { in: ["AUDIO_PENDING", "AUDIO_READY", "QUEUED", "SENDING"] },
+      campaignContact: { campaignId },
+      status: { in: ["PENDING", "SCHEDULED", "QUEUED", "SUBMITTING"] },
     },
   });
   if (active === 0)

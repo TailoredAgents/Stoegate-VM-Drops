@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { requireUser } from "@/lib/auth";
 import { normalizeUSPhone } from "@/lib/phone";
-import { suppressPhoneAndExit } from "@/lib/outreach-service";
+import { suppressPhoneGlobally } from "@/lib/suppression";
 
 export async function addSuppressionAction(formData: FormData) {
   const user = await requireUser();
@@ -23,7 +23,7 @@ export async function addSuppressionAction(formData: FormData) {
     .parse(Object.fromEntries(formData));
   const normalizedPhone = normalizeUSPhone(input.phone);
   if (!normalizedPhone) throw new Error("Enter a valid US phone number");
-  await suppressPhoneAndExit({
+  await suppressPhoneGlobally({
     normalizedPhone,
     reason: input.reason,
     notes: input.notes,
@@ -31,4 +31,6 @@ export async function addSuppressionAction(formData: FormData) {
     actorUserId: user.id,
   });
   revalidatePath("/suppression");
+  revalidatePath("/inbox");
+  revalidatePath("/operations");
 }
