@@ -14,11 +14,18 @@ import {
   type NumericSettingKey,
   type TextSettingKey,
 } from "@/lib/settings";
+import { reconcileTwilioMessageCosts } from "@/lib/twilio-cost-reconciliation";
+import {
+  acknowledgeTwilioProductionApproval,
+  revokeTwilioProductionApproval,
+  runTwilioReadinessDiagnostic,
+} from "@/lib/twilio-readiness";
 
 const integerKeys = new Set<NumericSettingKey>([
   "sms_provider_fixed_monthly_fee_cents",
   "sms_cost_per_outbound_message_micros",
   "sms_cost_per_segment_micros",
+  "sms_carrier_surcharge_per_outbound_segment_micros",
   "sms_cost_per_inbound_message_micros",
   "sms_phone_number_monthly_cents",
   "sms_registration_monthly_cents",
@@ -84,4 +91,36 @@ export async function updateSettingsAction(formData: FormData) {
   revalidatePath("/dashboard");
   revalidatePath("/operations");
   revalidatePath("/campaigns/new");
+}
+
+async function requireAdmin() {
+  const user = await requireUser();
+  if (user.role !== "ADMIN") throw new Error("Admin access required");
+  return user;
+}
+
+export async function runTwilioDiagnosticAction() {
+  const user = await requireAdmin();
+  await runTwilioReadinessDiagnostic({ actorUserId: user.id });
+  revalidatePath("/settings");
+}
+
+export async function acknowledgeTwilioProductionApprovalAction() {
+  const user = await requireAdmin();
+  await acknowledgeTwilioProductionApproval({ actorUserId: user.id });
+  revalidatePath("/settings");
+}
+
+export async function revokeTwilioProductionApprovalAction() {
+  const user = await requireAdmin();
+  await revokeTwilioProductionApproval({ actorUserId: user.id });
+  revalidatePath("/settings");
+}
+
+export async function reconcileTwilioCostsAction() {
+  const user = await requireAdmin();
+  await reconcileTwilioMessageCosts({ actorUserId: user.id, limit: 25 });
+  revalidatePath("/settings");
+  revalidatePath("/operations");
+  revalidatePath("/dashboard");
 }

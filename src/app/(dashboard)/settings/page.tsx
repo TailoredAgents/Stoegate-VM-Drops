@@ -1,19 +1,42 @@
 import {
+  BadgeCheck,
   BadgeDollarSign,
   CalendarClock,
+  CircleAlert,
   MessageSquareText,
+  RefreshCw,
   ShieldCheck,
+  ShieldOff,
   Users,
+  WalletCards,
 } from "lucide-react";
 
+import { requireUser } from "@/lib/auth";
 import { calculateVABenchmarks } from "@/lib/costs";
 import { getEnv } from "@/lib/env";
 import { getAppSettings } from "@/lib/settings";
+import {
+  getTwilioReadinessStatus,
+  type TwilioReadinessStatus,
+} from "@/lib/twilio-readiness";
 import { formatCents } from "@/lib/utils";
-import { updateSettingsAction } from "./actions";
+import {
+  acknowledgeTwilioProductionApprovalAction,
+  reconcileTwilioCostsAction,
+  revokeTwilioProductionApprovalAction,
+  runTwilioDiagnosticAction,
+  updateSettingsAction,
+} from "./actions";
 
 export default async function SettingsPage() {
-  const [settings, env] = await Promise.all([getAppSettings(), getEnv()]);
+  const user = await requireUser();
+  const env = getEnv();
+  const [settings, twilioReadiness] = await Promise.all([
+    getAppSettings(),
+    user.role === "ADMIN"
+      ? getTwilioReadinessStatus({ env })
+      : Promise.resolve(null),
+  ]);
   const va = calculateVABenchmarks({
     hourlyRateCents: settings.va_hourly_rate_cents,
     realConversationsPerHour: settings.va_real_conversations_per_hour,
@@ -30,6 +53,13 @@ export default async function SettingsPage() {
           the human cold-calling benchmark.
         </p>
       </div>
+
+      {twilioReadiness ? (
+        <TwilioReadinessPanel
+          status={twilioReadiness}
+          timezone={settings.operations_timezone}
+        />
+      ) : null}
 
       <form action={updateSettingsAction} className="mt-6 space-y-5">
         <div className="grid gap-5 xl:grid-cols-2">
@@ -135,6 +165,13 @@ export default async function SettingsPage() {
                 value={settings.sms_cost_per_segment_micros}
               />
               <SettingInput
+                label="Carrier surcharge / outbound segment (micros)"
+                name="sms_carrier_surcharge_per_outbound_segment_micros"
+                value={
+                  settings.sms_carrier_surcharge_per_outbound_segment_micros
+                }
+              />
+              <SettingInput
                 label="Inbound message cost (micros)"
                 name="sms_cost_per_inbound_message_micros"
                 value={settings.sms_cost_per_inbound_message_micros}
@@ -235,6 +272,221 @@ export default async function SettingsPage() {
       </form>
     </>
   );
+}
+
+function TwilioReadinessPanel({
+  status,
+  timezone,
+}: {
+  status: TwilioReadinessStatus;
+  timezone: string;
+}) {
+  const details = status.diagnostic?.details;
+  const authenticationSuccessful = typeof details?.accountStatus === "string";
+  const messagingServiceFound =
+    typeof details?.serviceFriendlyName === "string";
+  const approvalCanBeRevoked = status.approval?.decision === "APPROVED";
+  return (
+    <section className="card mt-6 p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="flex items-center gap-2 font-bold">
+            {status.ready ? (
+              <BadgeCheck className="h-5 w-5 text-emerald-700" />
+            ) : (
+              <CircleAlert className="h-5 w-5 text-amber-600" />
+            )}
+            Twilio production readiness
+          </h2>
+          <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-500">
+            A recent read-only diagnostic and a separate active-admin
+            acknowledgement are both required. Diagnostics inspect Twilio
+            account, Messaging Service, Sender Pool, A2P registration metadata,
+            and webhook configuration; they never send a message.
+          </p>
+        </div>
+        <span
+          className={`rounded-full px-3 py-1 text-xs font-bold ${
+            status.ready
+              ? "bg-emerald-100 text-emerald-800"
+              : "bg-amber-100 text-amber-800"
+          }`}
+        >
+          {status.ready ? "Ready" : "Blocked"}
+        </span>
+      </div>
+
+      <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3">
+        <p className="text-sm font-semibold text-slate-800">{status.reason}</p>
+        <div className="mt-2 grid gap-2 text-xs text-slate-600 sm:grid-cols-2 lg:grid-cols-3">
+          <p>
+            Twilio credentials:{" "}
+            {status.configured ? "configured" : "incomplete"}
+          </p>
+          <p>
+            Authentication:{" "}
+            {authenticationSuccessful ? "successful" : "not verified"}
+          </p>
+          <p>
+            Messaging Service:{" "}
+            {messagingServiceFound ? "found" : "not verified"}
+          </p>
+          <p>
+            Provider selection:{" "}
+            {status.providerSelected ? "Twilio" : "not Twilio"}
+          </p>
+          <p>
+            SMS_LIVE_SENDS_ENABLED:{" "}
+            {status.liveSendsEnabled ? "enabled" : "disabled"}
+          </p>
+          <p>
+            TWILIO_PRODUCTION_APPROVED:{" "}
+            {status.environmentProductionApproved ? "enabled" : "disabled"}
+          </p>
+          <p>
+            Read-only diagnostic:{" "}
+            {status.diagnosticReady ? "passing" : "required"}
+          </p>
+          <p>
+            Admin acknowledgement:{" "}
+            {status.approvalReady ? "active" : "required"}
+          </p>
+        </div>
+        <p className="mt-2 text-xs leading-5 text-slate-500">
+          Twilio-reported registration data and the admin acknowledgement are
+          readiness evidence only; this panel does not independently claim
+          carrier approval.
+        </p>
+      </div>
+
+      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+        <div className="rounded-lg border border-slate-200 p-4">
+          <h3 className="text-sm font-bold text-slate-900">
+            Latest diagnostic
+          </h3>
+          {status.diagnostic ? (
+            <div className="mt-2 space-y-1 text-xs leading-5 text-slate-600">
+              <p>
+                <strong>{status.diagnostic.status}</strong> by{" "}
+                {status.diagnostic.checkedByEmail} at{" "}
+                {formatReadinessTime(status.diagnostic.checkedAt, timezone)}
+              </p>
+              <p>{status.diagnostic.summary}</p>
+              <p>
+                Account: {details?.accountStatus ?? "unknown"} · Service:{" "}
+                {details?.serviceFriendlyName ?? "unknown"}
+              </p>
+              <p>
+                Sender Pool: {details?.senderCount ?? 0} member(s),{" "}
+                {details?.smsCapableSenderCount ?? 0} SMS-capable
+              </p>
+              <p>
+                Twilio-reported registration flag:{" "}
+                {String(details?.usAppToPersonRegistered ?? false)}
+                {" · "}Twilio-reported campaign status:{" "}
+                {details?.campaignStatuses?.join(", ") || "none"}
+              </p>
+              <p>
+                Inbound webhook:{" "}
+                {details?.inboundWebhookActual || "not configured"}
+                {details?.inboundMethod ? ` (${details.inboundMethod})` : ""}
+              </p>
+            </div>
+          ) : (
+            <p className="mt-2 text-xs text-slate-500">
+              No diagnostic has been recorded.
+            </p>
+          )}
+        </div>
+
+        <div className="rounded-lg border border-slate-200 p-4">
+          <h3 className="text-sm font-bold text-slate-900">
+            Production approval audit
+          </h3>
+          {status.approval ? (
+            <div className="mt-2 space-y-1 text-xs leading-5 text-slate-600">
+              <p>
+                <strong>{status.approval.decision}</strong> by{" "}
+                {status.approval.actorEmail} at{" "}
+                {formatReadinessTime(status.approval.occurredAt, timezone)}
+              </p>
+              <p>
+                Admin identity:{" "}
+                {status.approval.actorIsActiveAdmin ? "active" : "inactive"}
+                {" · "}Current configuration:{" "}
+                {status.approval.configurationMatches
+                  ? "matches"
+                  : "does not match"}
+              </p>
+            </div>
+          ) : (
+            <p className="mt-2 text-xs text-slate-500">
+              No administrator has acknowledged production approval.
+            </p>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-4 flex flex-wrap gap-3">
+        <form action={runTwilioDiagnosticAction}>
+          <button
+            className="btn-secondary"
+            type="submit"
+            formNoValidate
+            disabled={!status.configured}
+          >
+            <RefreshCw className="h-4 w-4" />
+            Run read-only diagnostic
+          </button>
+        </form>
+        <form action={acknowledgeTwilioProductionApprovalAction}>
+          <button
+            className="btn-primary"
+            type="submit"
+            formNoValidate
+            disabled={!status.diagnosticReady || status.approvalReady}
+          >
+            <ShieldCheck className="h-4 w-4" />
+            Acknowledge production approval
+          </button>
+        </form>
+        <form action={revokeTwilioProductionApprovalAction}>
+          <button
+            className="btn-secondary border-red-200 text-red-700 hover:bg-red-50"
+            type="submit"
+            formNoValidate
+            disabled={!approvalCanBeRevoked}
+          >
+            <ShieldOff className="h-4 w-4" />
+            Revoke approval
+          </button>
+        </form>
+        <form action={reconcileTwilioCostsAction}>
+          <button
+            className="btn-secondary"
+            type="submit"
+            formNoValidate
+            disabled={!status.configured}
+          >
+            <WalletCards className="h-4 w-4" />
+            Reconcile up to 25 actual Twilio costs
+          </button>
+        </form>
+      </div>
+      <p className="mt-3 text-xs text-slate-500">
+        Diagnostic and cost reconciliation buttons perform bounded provider
+        reads only and send nothing. Nothing runs automatically or polls Twilio.
+      </p>
+    </section>
+  );
+}
+
+function formatReadinessTime(value: Date, timezone: string) {
+  return new Intl.DateTimeFormat("en-US", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: timezone,
+  }).format(value);
 }
 
 function Benchmark({ label, value }: { label: string; value: number }) {

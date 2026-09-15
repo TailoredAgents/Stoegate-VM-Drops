@@ -183,6 +183,38 @@ describe("SMS inbound identity and matching", () => {
     ).toBe("newest");
   });
 
+  it("does not invent attribution when reciprocal messages have tied context", () => {
+    const tiedAt = new Date("2026-09-14T16:00:00.000Z");
+    const candidate = {
+      providerKey: "twilio",
+      providerMessageId: "SM111",
+      toPhone: "+15125550123",
+      fromPhone: "+15125550999",
+      status: "SENT" as const,
+      acceptedAt: tiedAt,
+      sentAt: tiedAt,
+      createdAt: tiedAt,
+    };
+
+    expect(
+      selectMostRecentReplyCandidate(
+        [
+          { ...candidate, id: "campaign-contact-a" },
+          {
+            ...candidate,
+            id: "campaign-contact-b",
+            providerMessageId: "SM222",
+          },
+        ],
+        {
+          providerKey: "twilio",
+          fromPhone: "+15125550123",
+          toPhone: "+15125550999",
+        },
+      ),
+    ).toBeNull();
+  });
+
   it("records one row for duplicate provider delivery and preserves raw JSON", async () => {
     const tx = makeTx();
     let stored:
@@ -238,6 +270,258 @@ describe("SMS inbound identity and matching", () => {
       },
     });
   });
+
+  it("treats a repeated Twilio STOP as a duplicate without another suppression write", async () => {
+    const tx = makeTx();
+    tx.smsInboundMessage.findUnique.mockResolvedValue({
+      id: "inbound-stop-1",
+      conversationId: null,
+      inReplyToMessageId: null,
+      fromPhone: "+15125550123",
+      toPhone: "+15125550999",
+      body: "STOP",
+      classification: "OPT_OUT",
+    });
+    mocks.transaction.mockImplementation(async (work) => work(tx));
+
+    const result = await recordSmsInboundMessage({
+      ...inboundInput,
+      providerKey: "twilio",
+      body: "STOP",
+      providerOptOut: true,
+    });
+
+    expect(result).toMatchObject({
+      duplicate: true,
+      classification: "OPT_OUT",
+    });
+    expect(tx.suppressionEntry.upsert).not.toHaveBeenCalled();
+    expect(tx.smsInboundMessage.create).not.toHaveBeenCalled();
+  });
+
+  it("promotes a duplicate when a verified Twilio opt-out signal arrives later", async () => {
+    const tx = makeTx();
+    tx.smsInboundMessage.findUnique.mockResolvedValue({
+      id: "inbound-promoted-1",
+      conversationId: null,
+      inReplyToMessageId: null,
+      fromPhone: "+15125550123",
+      toPhone: "+15125550999",
+      body: inboundInput.body,
+      classification: "UNCLASSIFIED",
+      isOptOut: false,
+    });
+    mocks.transaction.mockImplementation(async (work) => work(tx));
+
+    const result = await recordSmsInboundMessage({
+      ...inboundInput,
+      providerKey: "twilio",
+      providerOptOut: true,
+    });
+
+    expect(result).toMatchObject({
+      duplicate: true,
+      classification: "OPT_OUT",
+    });
+    expect(tx.suppressionEntry.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          reason: "OPT_OUT",
+          source: "TWILIO_INBOUND_OPT_OUT",
+        }),
+      }),
+    );
+    expect(tx.smsInboundMessage.update).toHaveBeenCalledWith({
+      where: { id: "inbound-promoted-1" },
+      data: expect.objectContaining({
+        isOptOut: true,
+        classification: "OPT_OUT",
+      }),
+    });
+    expect(tx.smsInboundMessage.create).not.toHaveBeenCalled();
+  });
+
+  it("preserves a tied recent-message match for operator review", async () => {
+    const tx = makeTx();
+    const contextAt = new Date("2026-09-14T16:00:00.000Z");
+    tx.$queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        { id: "outbound-a", contextAt },
+        { id: "outbound-b", contextAt },
+      ]);
+    tx.contact.findUnique.mockResolvedValue({ id: "contact-1" });
+    tx.campaignContact.findMany.mockResolvedValue([
+      {
+        id: "campaign-contact-a",
+        campaignId: "campaign-a",
+        contactId: "contact-1",
+        outreachSequence: { id: "sequence-a" },
+      },
+      {
+        id: "campaign-contact-b",
+        campaignId: "campaign-b",
+        contactId: "contact-1",
+        outreachSequence: { id: "sequence-b" },
+      },
+    ]);
+    tx.outreachSequence.findUnique.mockImplementation(async ({ where }) => ({
+      ...sequence,
+      id: where.id,
+    }));
+    mocks.transaction.mockImplementation(async (work) => work(tx));
+
+    const result = await recordSmsInboundMessage({
+      ...inboundInput,
+      providerKey: "twilio",
+    });
+
+    expect(result).toMatchObject({
+      matchedOutboundMessageId: null,
+      conversationId: null,
+      classification: "NEEDS_REVIEW",
+    });
+    expect(tx.smsOutboundMessage.findUnique).not.toHaveBeenCalled();
+    expect(tx.smsInboundMessage.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        campaignContactId: undefined,
+        classification: "NEEDS_REVIEW",
+      }),
+    });
+    expect(tx.campaignSuppression.upsert).toHaveBeenCalledTimes(2);
+    expect(mocks.transitionSmsSequenceTx).toHaveBeenCalledTimes(2);
+    expect(mocks.transitionSmsSequenceTx).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        source: "sms_inbound_ambiguous_reply_hold",
+        resultingState: "SMS_REPLIED",
+        projection: expect.objectContaining({
+          terminalReason: "AMBIGUOUS_SMS_REPLY_REVIEW",
+          coldCallDueAt: null,
+          coldCallEligibleAt: null,
+        }),
+      }),
+    );
+  });
+
+  it("holds null-sender candidates when a Twilio reply beats sender assignment", async () => {
+    const tx = makeTx();
+    tx.$queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        { id: "outbound-awaiting-sender", contextAt: receivedAt },
+      ]);
+    tx.contact.findUnique.mockResolvedValue({ id: "contact-1" });
+    tx.campaignContact.findMany.mockResolvedValue([
+      {
+        id: "campaign-contact-a",
+        campaignId: "campaign-a",
+        contactId: "contact-1",
+        outreachSequence: { id: "sequence-a" },
+      },
+    ]);
+    tx.outreachSequence.findUnique.mockResolvedValue({
+      ...sequence,
+      id: "sequence-a",
+    });
+    mocks.transaction.mockImplementation(async (work) => work(tx));
+
+    const result = await recordSmsInboundMessage({
+      ...inboundInput,
+      providerKey: "twilio",
+    });
+
+    expect(result).toMatchObject({
+      matchedOutboundMessageId: null,
+      conversationId: null,
+      classification: "NEEDS_REVIEW",
+    });
+    expect(tx.smsInboundMessage.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        campaignContactId: undefined,
+        inReplyToMessageId: undefined,
+        classification: "NEEDS_REVIEW",
+      }),
+    });
+    expect(mocks.transitionSmsSequenceTx).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        source: "sms_inbound_unresolved_sender_reply_hold",
+        projection: expect.objectContaining({
+          terminalReason: "UNRESOLVED_SENDER_SMS_REPLY_REVIEW",
+          coldCallDueAt: null,
+          coldCallEligibleAt: null,
+        }),
+      }),
+    );
+  });
+
+  it("holds a newer null-sender message instead of attributing to an older exact sender", async () => {
+    const tx = makeTx();
+    tx.$queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          id: "older-exact-outbound",
+          contextAt: new Date("2026-09-14T15:00:00.000Z"),
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: "newer-null-sender-outbound",
+          contextAt: new Date("2026-09-14T16:00:00.000Z"),
+        },
+      ]);
+    tx.contact.findUnique.mockResolvedValue({ id: "contact-1" });
+    tx.campaignContact.findMany.mockResolvedValue([
+      {
+        id: "campaign-contact-old",
+        campaignId: "campaign-old",
+        contactId: "contact-1",
+        outreachSequence: { id: "sequence-old" },
+      },
+      {
+        id: "campaign-contact-new",
+        campaignId: "campaign-new",
+        contactId: "contact-1",
+        outreachSequence: { id: "sequence-new" },
+      },
+    ]);
+    tx.outreachSequence.findUnique.mockImplementation(async ({ where }) => ({
+      ...sequence,
+      id: where.id,
+    }));
+    mocks.transaction.mockImplementation(async (work) => work(tx));
+
+    const result = await recordSmsInboundMessage({
+      ...inboundInput,
+      providerKey: "twilio",
+    });
+
+    expect(result).toMatchObject({
+      matchedOutboundMessageId: null,
+      classification: "NEEDS_REVIEW",
+    });
+    expect(tx.smsOutboundMessage.findUnique).not.toHaveBeenCalled();
+    expect(tx.campaignContact.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          outboundMessages: {
+            some: {
+              id: {
+                in: ["older-exact-outbound", "newer-null-sender-outbound"],
+              },
+            },
+          },
+        },
+      }),
+    );
+    expect(mocks.transitionSmsSequenceTx).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("SMS inbound safety effects", () => {
@@ -246,7 +530,9 @@ describe("SMS inbound safety effects", () => {
     tx.$queryRaw
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{ id: "outbound-1" }]);
+      .mockResolvedValueOnce([
+        { id: "outbound-1", contextAt: matchedOutbound().sentAt },
+      ]);
     tx.smsOutboundMessage.findUnique.mockResolvedValue(matchedOutbound());
     tx.smsConversation.upsert.mockResolvedValue({
       id: "conversation-1",
@@ -318,7 +604,9 @@ describe("SMS inbound safety effects", () => {
     tx.$queryRaw
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{ id: "outbound-1" }]);
+      .mockResolvedValueOnce([
+        { id: "outbound-1", contextAt: matchedOutbound().sentAt },
+      ]);
     tx.smsOutboundMessage.findUnique.mockResolvedValue(matchedOutbound());
     tx.smsConversation.upsert.mockResolvedValue({
       id: "conversation-1",
@@ -335,7 +623,12 @@ describe("SMS inbound safety effects", () => {
     tx.outreachSequence.findMany.mockResolvedValue([{ id: "sequence-1" }]);
     mocks.transaction.mockImplementation(async (work) => work(tx));
 
-    await recordSmsInboundMessage({ ...inboundInput, body: "REMOVE ME" });
+    await recordSmsInboundMessage({
+      ...inboundInput,
+      providerKey: "twilio",
+      body: "STOP",
+      providerOptOut: true,
+    });
 
     expect(tx.smsInboundMessage.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -349,6 +642,7 @@ describe("SMS inbound safety effects", () => {
         create: expect.objectContaining({
           normalizedPhone: "+15125550123",
           reason: "OPT_OUT",
+          source: "TWILIO_INBOUND_OPT_OUT",
         }),
       }),
     );

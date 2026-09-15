@@ -11,12 +11,20 @@ const mocks = vi.hoisted(() => ({
   getNextBusinessDayStart: vi.fn(),
   localDateKey: vi.fn(),
   localDateStorageValue: vi.fn(),
+  assertFreshTwilioReadiness: vi.fn(),
+  lockSmsProviderReadinessSharedTx: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({ db: { $transaction: mocks.transaction } }));
 vi.mock("@/lib/env", () => ({ getEnv: mocks.getEnv }));
 vi.mock("@/lib/settings", () => ({
   getAppSettings: mocks.getAppSettings,
+}));
+vi.mock("@/lib/twilio-readiness", () => ({
+  assertFreshTwilioReadiness: mocks.assertFreshTwilioReadiness,
+}));
+vi.mock("@/lib/sms-dispatch-lock", () => ({
+  lockSmsProviderReadinessSharedTx: mocks.lockSmsProviderReadinessSharedTx,
 }));
 vi.mock("@/lib/time", () => ({
   getBusinessSendWindowAvailability: mocks.getBusinessSendWindowAvailability,
@@ -224,6 +232,7 @@ describe("atomic live SMS reservation", () => {
     mocks.getNextBusinessDayStart.mockReturnValue(NEXT_BUSINESS_DAY);
     mocks.localDateKey.mockReturnValue("2026-09-15");
     mocks.localDateStorageValue.mockReturnValue(LOCAL_DATE);
+    mocks.assertFreshTwilioReadiness.mockResolvedValue({ ready: true });
   });
 
   it("reserves attempt one and all submitting state in one transaction", async () => {
@@ -248,6 +257,10 @@ describe("atomic live SMS reservation", () => {
         campaignTimezone: "America/Chicago",
       },
     });
+    expect(mocks.lockSmsProviderReadinessSharedTx).toHaveBeenCalledWith(
+      tx,
+      "provider-x",
+    );
     expect(tx.smsOutboundAttempt.create).toHaveBeenCalledTimes(1);
     expect(tx.smsUsageLedger.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ kind: "ATTEMPT", messageId: message.id }),
@@ -304,6 +317,85 @@ describe("atomic live SMS reservation", () => {
         }),
       }),
     );
+  });
+
+  it("does not reacquire readiness when dispatch holds it across the provider call", async () => {
+    await reserveLiveSmsAttempt({
+      messageId: message.id,
+      occurredAt: NOW,
+      readinessLockAlreadyHeld: true,
+    });
+
+    expect(mocks.lockSmsProviderReadinessSharedTx).not.toHaveBeenCalled();
+  });
+
+  it("passes the complete Twilio readiness guard and reserves with only a Messaging Service", async () => {
+    const messagingServiceSid = `MG${"b".repeat(32)}`;
+    message.fromPhone = null;
+    message.campaignContact.campaign.smsProviderKey = "twilio";
+    message.campaignContact.campaign.smsSenderRef = messagingServiceSid;
+    mocks.getEnv.mockReturnValue({
+      SMS_LIVE_SENDS_ENABLED: true,
+      SMS_PROVIDER: "twilio",
+      TWILIO_PRODUCTION_APPROVED: true,
+      TWILIO_ACCOUNT_SID: `AC${"a".repeat(32)}`,
+      TWILIO_AUTH_TOKEN: "test-auth-token",
+      TWILIO_MESSAGING_SERVICE_SID: messagingServiceSid,
+      MAX_LIVE_SMS_CAMPAIGN_LIMIT: 10,
+      MAX_LIVE_DAILY_SMS_LIMIT: 10,
+    });
+
+    const result = await reserveLiveSmsAttempt({
+      messageId: message.id,
+      occurredAt: NOW,
+    });
+
+    expect(mocks.assertFreshTwilioReadiness).toHaveBeenCalledWith({
+      client: tx,
+      env: expect.objectContaining({ SMS_PROVIDER: "twilio" }),
+      now: NOW,
+    });
+    expect(tx.smsOutboundAttempt.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          requestPayload: {
+            to: message.toPhone,
+            messagingServiceSid,
+            bodyHash: message.bodyHash,
+            segmentCount: message.segmentCount,
+          },
+        }),
+      }),
+    );
+    expect(result).toMatchObject({
+      reserved: true,
+      providerKey: "twilio",
+      message: { fromPhone: null, senderReference: messagingServiceSid },
+    });
+  });
+
+  it("creates no attempt when the persisted Twilio readiness guard fails", async () => {
+    const messagingServiceSid = `MG${"b".repeat(32)}`;
+    message.fromPhone = null;
+    message.campaignContact.campaign.smsProviderKey = "twilio";
+    message.campaignContact.campaign.smsSenderRef = messagingServiceSid;
+    mocks.getEnv.mockReturnValue({
+      SMS_LIVE_SENDS_ENABLED: true,
+      SMS_PROVIDER: "twilio",
+      TWILIO_PRODUCTION_APPROVED: true,
+      TWILIO_MESSAGING_SERVICE_SID: messagingServiceSid,
+      MAX_LIVE_SMS_CAMPAIGN_LIMIT: 10,
+      MAX_LIVE_DAILY_SMS_LIMIT: 10,
+    });
+    mocks.assertFreshTwilioReadiness.mockRejectedValue(
+      new Error("Twilio live sending is blocked: diagnostic expired"),
+    );
+
+    await expect(
+      reserveLiveSmsAttempt({ messageId: message.id, occurredAt: NOW }),
+    ).rejects.toThrow(/diagnostic expired/i);
+    expect(tx.smsOutboundAttempt.create).not.toHaveBeenCalled();
+    expect(tx.smsUsageLedger.create).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -500,6 +592,8 @@ describe("live SMS result and delivery persistence", () => {
       providerResponse: { sid: "provider-message-1", accepted: true },
       actualSegmentCount: 2,
       actualCostMicros: 1600,
+      currency: "eur",
+      fromPhone: "+12025550999",
       occurredAt: NOW,
     });
 
@@ -523,6 +617,8 @@ describe("live SMS result and delivery persistence", () => {
           status: "ACCEPTED",
           actualSegmentCount: 2,
           actualCostMicros: 1600,
+          currency: "EUR",
+          fromPhone: "+12025550999",
         }),
       }),
     );
@@ -571,6 +667,34 @@ describe("live SMS result and delivery persistence", () => {
     expect(tx.smsUsageLedger.create).not.toHaveBeenCalled();
   });
 
+  it("rejects provider cost without its currency unit", async () => {
+    await expect(
+      persistLiveSmsProviderResult({
+        messageId: message.id,
+        attemptId: "a0000000-0000-4000-8000-00000000000a",
+        outcome: "UNKNOWN",
+        actualCostMicros: 1700,
+      }),
+    ).rejects.toThrow(
+      "Provider actual cost and currency must be supplied together",
+    );
+
+    await expect(
+      persistSmsDeliveryStatus({
+        messageId: message.id,
+        providerKey: "provider-x",
+        providerEventId: "delivery-event-no-currency",
+        providerMessageId: "provider-message-1",
+        providerStatus: "delivered",
+        outcome: "DELIVERED",
+        rawPayload: {},
+        actualCostMicros: 1700,
+      }),
+    ).rejects.toThrow(
+      "Provider actual cost and currency must be supplied together",
+    );
+  });
+
   it("lets genuine delivery recover SUBMISSION_UNKNOWN and records both ledgers", async () => {
     message.status = "SUBMISSION_UNKNOWN";
     message.providerMessageId = "provider-message-1";
@@ -596,6 +720,7 @@ describe("live SMS result and delivery persistence", () => {
       rawPayload: { status: "delivered" },
       actualSegmentCount: 2,
       actualCostMicros: 1700,
+      currency: "USD",
       occurredAt: NOW,
       receivedAt: NOW,
     });
@@ -636,6 +761,127 @@ describe("live SMS result and delivery persistence", () => {
         data: [expect.objectContaining({ kind: "DELIVERED" })],
       }),
     );
+  });
+
+  it("records a Twilio queued callback as accepted without starting the cold-call clock", async () => {
+    message.providerKey = "twilio";
+    const result = await persistSmsDeliveryStatus({
+      messageId: message.id,
+      providerKey: "twilio",
+      providerEventId: "twilio-queued-event",
+      providerMessageId: "SMqueued",
+      providerStatus: "queued",
+      outcome: "ACCEPTED",
+      rawPayload: { MessageStatus: "queued", From: "+12025550999" },
+      fromPhone: "+12025550999",
+      occurredAt: NOW,
+      receivedAt: NOW,
+    });
+
+    expect(result.messageStatus).toBe("ACCEPTED");
+    expect(tx.smsOutboundMessage.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "ACCEPTED",
+          fromPhone: "+12025550999",
+          sentAt: undefined,
+        }),
+      }),
+    );
+    expect(tx.outreachSequence.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          currentState: "SMS_ACCEPTED",
+          smsSentAt: null,
+          coldCallDueAt: null,
+        }),
+      }),
+    );
+  });
+
+  it("stores a Twilio failed status and provider error code", async () => {
+    message.providerKey = "twilio";
+    await persistSmsDeliveryStatus({
+      messageId: message.id,
+      providerKey: "twilio",
+      providerEventId: "twilio-failed-event",
+      providerMessageId: "SMfailed",
+      providerStatus: "failed",
+      outcome: "FAILED",
+      rawPayload: { MessageStatus: "failed", ErrorCode: "30007" },
+      errorCode: "30007",
+      errorMessage: "Provider supplied diagnostic text",
+      occurredAt: NOW,
+      receivedAt: NOW,
+    });
+
+    expect(tx.smsStatusEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          errorCode: "30007",
+          errorMessage: "Provider supplied diagnostic text",
+        }),
+      }),
+    );
+    expect(tx.smsOutboundMessage.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "FAILED",
+          errorCode: "30007",
+          failedAt: NOW,
+        }),
+      }),
+    );
+  });
+
+  it("leaves a Twilio provider opt-out event pending until suppression commits", async () => {
+    message.providerKey = "twilio";
+    await persistSmsDeliveryStatus({
+      messageId: message.id,
+      providerKey: "twilio",
+      providerEventId: "twilio-opt-out-event",
+      providerMessageId: "SMoptout",
+      providerStatus: "failed",
+      outcome: "FAILED",
+      rawPayload: { MessageStatus: "failed", ErrorCode: "21610" },
+      errorCode: "21610",
+      occurredAt: NOW,
+      receivedAt: NOW,
+    });
+
+    expect(tx.smsStatusEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          errorCode: "21610",
+          processedAt: null,
+        }),
+      }),
+    );
+  });
+
+  it("preserves delivered when an older sent state arrives later", async () => {
+    message.status = "DELIVERED";
+    message.providerMessageId = "SMdelivered";
+
+    const result = await persistSmsDeliveryStatus({
+      messageId: message.id,
+      providerKey: "provider-x",
+      providerEventId: "late-sent",
+      providerMessageId: "SMdelivered",
+      providerStatus: "sent",
+      outcome: "SENT",
+      rawPayload: { MessageStatus: "sent" },
+      occurredAt: NOW,
+      receivedAt: NOW,
+    });
+
+    expect(result).toMatchObject({
+      updated: false,
+      reason: "monotonic_noop",
+      messageStatus: "DELIVERED",
+    });
+    expect(tx.smsStatusEvent.create).toHaveBeenCalledTimes(1);
+    expect(tx.smsOutboundMessage.update).not.toHaveBeenCalled();
   });
 
   it.each(["FAILED", "UNDELIVERED"])(

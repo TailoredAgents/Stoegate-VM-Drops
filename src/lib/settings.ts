@@ -5,6 +5,7 @@ export const NUMERIC_SETTINGS = {
   sms_provider_fixed_monthly_fee_cents: 0,
   sms_cost_per_outbound_message_micros: 0,
   sms_cost_per_segment_micros: 0,
+  sms_carrier_surcharge_per_outbound_segment_micros: 0,
   sms_cost_per_inbound_message_micros: 0,
   sms_phone_number_monthly_cents: 0,
   sms_registration_monthly_cents: 0,
@@ -22,7 +23,7 @@ export const TEXT_SETTINGS = {
   operations_timezone: "America/New_York",
   sms_send_window_start: "09:00",
   sms_send_window_end: "20:00",
-  sms_provider_display_name: "Not selected",
+  sms_provider_display_name: "Twilio",
   sms_sender_identification: "",
   sms_compliance_notes: "",
 } as const;

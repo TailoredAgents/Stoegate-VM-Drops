@@ -111,6 +111,16 @@ enum SmsUsageKind {
   DELIVERED
 }
 
+enum ProviderDiagnosticStatus {
+  PASSED
+  FAILED
+}
+
+enum ProviderApprovalDecision {
+  APPROVED
+  REVOKED
+}
+
 enum ImportStatus {
   STAGING
   ANALYZED
@@ -320,28 +330,30 @@ enum SuppressionReason {
 }
 
 model User {
-  id                          String                  @id @default(uuid()) @db.Uuid
-  email                       String                  @unique
+  id                          String                            @id @default(uuid()) @db.Uuid
+  email                       String                            @unique
   passwordHash                String
-  role                        UserRole                @default(ADMIN)
-  active                      Boolean                 @default(true)
-  createdAt                   DateTime                @default(now())
-  updatedAt                   DateTime                @updatedAt
+  role                        UserRole                          @default(ADMIN)
+  active                      Boolean                           @default(true)
+  createdAt                   DateTime                          @default(now())
+  updatedAt                   DateTime                          @updatedAt
   sessions                    Session[]
-  createdCampaigns            Campaign[]              @relation("CampaignCreatedBy")
-  approvedCampaigns           Campaign[]              @relation("CampaignApprovedBy")
-  launchedCampaigns           Campaign[]              @relation("CampaignLaunchedBy")
-  outreachEvents              OutreachEvent[]         @relation("OutreachEventActor")
-  outreachExports             OutreachExport[]        @relation("OutreachExportCreator")
-  externalOutcomeImports      ExternalOutcomeImport[] @relation("ExternalOutcomeImportCreator")
-  createdSmsTemplates         SmsTemplate[]           @relation("SmsTemplateCreator")
-  createdSmsTemplateVersions  SmsTemplateVersion[]    @relation("SmsTemplateVersionCreator")
-  approvedSmsTemplateVersions SmsTemplateVersion[]    @relation("SmsTemplateVersionApprover")
-  classifiedInboundMessages   SmsInboundMessage[]     @relation("SmsInboundClassifier")
-  createdSmsConsentEvidence   SmsConsentEvidence[]    @relation("SmsConsentEvidenceCreator")
-  createdCampaignSuppressions CampaignSuppression[]   @relation("CampaignSuppressionCreator")
-  createdGlobalSuppressions   SuppressionEntry[]      @relation("GlobalSuppressionCreator")
-  smsAuditEvents              SmsAuditEvent[]         @relation("SmsAuditEventActor")
+  createdCampaigns            Campaign[]                        @relation("CampaignCreatedBy")
+  approvedCampaigns           Campaign[]                        @relation("CampaignApprovedBy")
+  launchedCampaigns           Campaign[]                        @relation("CampaignLaunchedBy")
+  outreachEvents              OutreachEvent[]                   @relation("OutreachEventActor")
+  outreachExports             OutreachExport[]                  @relation("OutreachExportCreator")
+  externalOutcomeImports      ExternalOutcomeImport[]           @relation("ExternalOutcomeImportCreator")
+  createdSmsTemplates         SmsTemplate[]                     @relation("SmsTemplateCreator")
+  createdSmsTemplateVersions  SmsTemplateVersion[]              @relation("SmsTemplateVersionCreator")
+  approvedSmsTemplateVersions SmsTemplateVersion[]              @relation("SmsTemplateVersionApprover")
+  classifiedInboundMessages   SmsInboundMessage[]               @relation("SmsInboundClassifier")
+  createdSmsConsentEvidence   SmsConsentEvidence[]              @relation("SmsConsentEvidenceCreator")
+  createdCampaignSuppressions CampaignSuppression[]             @relation("CampaignSuppressionCreator")
+  createdGlobalSuppressions   SuppressionEntry[]                @relation("GlobalSuppressionCreator")
+  smsAuditEvents              SmsAuditEvent[]                   @relation("SmsAuditEventActor")
+  providerDiagnosticRuns      ProviderDiagnosticRun[]           @relation("ProviderDiagnosticCheckedBy")
+  providerApprovalEvents      ProviderProductionApprovalEvent[] @relation("ProviderProductionApprovalActor")
 }
 
 model Session {
@@ -863,6 +875,8 @@ model SmsOutboundMessage {
   @@index([status, scheduledFor])
   @@index([sequenceId, status])
   @@index([campaignContactId, status])
+  @@index([providerKey, status, errorCode])
+  @@index([providerKey, toPhone, fromPhone])
   @@index([conversationId, createdAt])
   @@index([templateVersionId])
   @@index([consentEvidenceId])
@@ -900,6 +914,8 @@ model SmsStatusEvent {
   providerMessageId String?
   status            SmsMessageStatus?
   providerStatus    String
+  errorCode         String?
+  errorMessage      String?
   rawPayload        Json
   occurredAt        DateTime?
   receivedAt        DateTime            @default(now())
@@ -910,7 +926,47 @@ model SmsStatusEvent {
   @@unique([providerKey, providerEventId])
   @@index([messageId, occurredAt])
   @@index([providerKey, providerMessageId])
+  @@index([providerKey, errorCode, processedAt])
   @@index([status, receivedAt])
+}
+
+model ProviderDiagnosticRun {
+  id                       String                            @id @default(uuid()) @db.Uuid
+  providerKey              String
+  status                   ProviderDiagnosticStatus
+  accountFingerprint       String
+  serviceFingerprint       String
+  configurationFingerprint String
+  summary                  String
+  details                  Json
+  checkedAt                DateTime
+  expiresAt                DateTime
+  checkedByUserId          String                            @db.Uuid
+  createdAt                DateTime                          @default(now())
+  checkedBy                User                              @relation("ProviderDiagnosticCheckedBy", fields: [checkedByUserId], references: [id], onDelete: Restrict)
+  approvalEvents           ProviderProductionApprovalEvent[]
+
+  @@index([providerKey, checkedAt])
+  @@index([providerKey, status, expiresAt])
+  @@index([checkedByUserId, checkedAt])
+}
+
+model ProviderProductionApprovalEvent {
+  id                       String                   @id @default(uuid()) @db.Uuid
+  sequence                 BigInt                   @unique @default(autoincrement())
+  providerKey              String
+  decision                 ProviderApprovalDecision
+  configurationFingerprint String
+  diagnosticRunId          String?                  @db.Uuid
+  actorUserId              String                   @db.Uuid
+  note                     String?
+  occurredAt               DateTime                 @default(now())
+  diagnosticRun            ProviderDiagnosticRun?   @relation(fields: [diagnosticRunId], references: [id], onDelete: Restrict)
+  actor                    User                     @relation("ProviderProductionApprovalActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+
+  @@index([providerKey, sequence])
+  @@index([actorUserId, occurredAt])
+  @@index([diagnosticRunId])
 }
 
 model SmsInboundMessage {

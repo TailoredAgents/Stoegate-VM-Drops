@@ -27,19 +27,35 @@ export function suppressionSequenceState(
   return reason === "WRONG_NUMBER" ? "WRONG_NUMBER" : "OPT_OUT";
 }
 
-export async function suppressPhoneGlobally(input: {
+export interface SuppressPhoneGloballyInput {
   normalizedPhone: string;
   reason: SuppressionReason;
   source: string;
   notes?: string;
   actorUserId?: string;
   occurredAt?: Date;
-}) {
+  /** Stable provider/event identity for replay-safe automatic suppression. */
+  idempotencyKey?: string;
+}
+
+async function suppressPhoneGloballyWithLockState(
+  input: SuppressPhoneGloballyInput,
+  phoneDispatchLockAlreadyHeld: boolean,
+) {
   const occurredAt = input.occurredAt ?? new Date();
-  const commandId = randomUUID();
+  const commandId = input.idempotencyKey?.trim() || randomUUID();
+  const auditIdempotencyKey = "sms-suppression:" + commandId;
   return db.$transaction(
     async (tx) => {
-      await lockSmsPhoneDispatchTx(tx, input.normalizedPhone);
+      if (!phoneDispatchLockAlreadyHeld)
+        await lockSmsPhoneDispatchTx(tx, input.normalizedPhone);
+      if (input.idempotencyKey) {
+        const replay = await tx.smsAuditEvent.findUnique({
+          where: { idempotencyKey: auditIdempotencyKey },
+          select: { id: true },
+        });
+        if (replay) return { sequenceCount: 0, duplicate: true };
+      }
       const contact = await tx.contact.findUnique({
         where: { normalizedPhone: input.normalizedPhone },
         select: { id: true },
@@ -180,7 +196,7 @@ export async function suppressPhoneGlobally(input: {
           entityType: "Phone",
           entityId: input.normalizedPhone,
           actorUserId: input.actorUserId,
-          idempotencyKey: "sms-suppression:" + commandId,
+          idempotencyKey: auditIdempotencyKey,
           source: input.source,
           before: existing
             ? ({
@@ -199,6 +215,7 @@ export async function suppressPhoneGlobally(input: {
       return {
         sequenceCount: campaignContacts.filter((row) => row.outreachSequence)
           .length,
+        duplicate: false,
       };
     },
     {
@@ -207,4 +224,19 @@ export async function suppressPhoneGlobally(input: {
       timeout: 60_000,
     },
   );
+}
+
+export async function suppressPhoneGlobally(input: SuppressPhoneGloballyInput) {
+  return suppressPhoneGloballyWithLockState(input, false);
+}
+
+/**
+ * Persist suppression before releasing `withSmsDispatchLock` for this exact
+ * phone. The caller already owns the session-level phone lock, so acquiring a
+ * transaction lock on another pooled connection would self-deadlock.
+ */
+export async function suppressPhoneGloballyWhileDispatchLocked(
+  input: SuppressPhoneGloballyInput,
+) {
+  return suppressPhoneGloballyWithLockState(input, true);
 }

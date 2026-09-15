@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  areSmsCostCurrenciesComparable,
   analyticsDateRange,
   buildAnalyticsCampaignContactWhere,
   buildSentMessageLifecycleWhere,
@@ -176,6 +177,13 @@ describe("SMS-first analytics filters", () => {
   it("uses the lower configured or environment daily live cap", () => {
     expect(effectiveGlobalDailySmsCap(2_000, 10)).toBe(10);
     expect(effectiveGlobalDailySmsCap(8, 10)).toBe(8);
+  });
+
+  it("only combines provider costs with USD configuration when units agree", () => {
+    expect(areSmsCostCurrenciesComparable([])).toBe(true);
+    expect(areSmsCostCurrenciesComparable(["usd", "USD"])).toBe(true);
+    expect(areSmsCostCurrenciesComparable(["EUR"])).toBe(false);
+    expect(areSmsCostCurrenciesComparable(["USD", "EUR"])).toBe(false);
   });
 });
 

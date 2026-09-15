@@ -27,6 +27,8 @@ export type SMSOutboundStatus =
 export interface SMSSendResult {
   status: SMSOutboundStatus;
   providerMessageId?: string;
+  /** The sender actually selected by the provider or its Messaging Service. */
+  from?: string;
   segments?: number;
   costMicros?: number;
   currency?: string;

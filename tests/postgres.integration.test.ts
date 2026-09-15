@@ -24,6 +24,7 @@ import { recordSmsInboundMessage } from "@/lib/sms-conversations";
 import { ensureSmsSequenceTx, reconcileSmsOutreach } from "@/lib/sms-outreach";
 import {
   processCanonicalSmsWebhook,
+  reconcileUnmatchedSmsStatusEvents,
   reconcileSynchronousSmsProviderResults,
 } from "@/lib/sms-webhooks";
 import { DryRunSMSProvider } from "@/providers/sms-dry-run";
@@ -1027,5 +1028,67 @@ describe("SMS-first PostgreSQL application integration", () => {
         where: { campaignContactId: target.campaignContactId },
       }),
     ).toBe(0);
+  });
+
+  it("skips permanent callback orphans when selecting a reconciliation batch", async () => {
+    const acceptedAt = new Date("2030-01-11T15:00:00.000Z");
+    const providerMessageId = `${prefix}-reconcile-match`;
+    const fixture = await createSmsFixture("reconcile-no-starvation", {
+      anchor: acceptedAt,
+      messageStatus: "ACCEPTED",
+      campaignContactStatus: "ACCEPTED",
+      sequenceState: "SMS_ACCEPTED",
+      providerMessageId,
+      acceptedAt,
+    });
+    await db.smsStatusEvent.createMany({
+      data: [
+        {
+          providerKey,
+          providerEventId: `${prefix}-permanent-orphan`,
+          providerMessageId: `${prefix}-missing-provider-message`,
+          providerStatus: "sent",
+          status: "SENT",
+          rawPayload: { test: true, orphan: true },
+          receivedAt: addHours(acceptedAt, -2),
+          processingError: "No outbound SMS matched this provider message ID",
+        },
+        {
+          providerKey,
+          providerEventId: `${prefix}-reconcilable-event`,
+          providerMessageId,
+          providerStatus: "sent",
+          status: "SENT",
+          rawPayload: { test: true, orphan: false },
+          receivedAt: addHours(acceptedAt, -1),
+          processingError: "No outbound SMS matched this provider message ID",
+        },
+      ],
+    });
+
+    await expect(reconcileUnmatchedSmsStatusEvents(1)).resolves.toEqual({
+      examined: 1,
+      matched: 1,
+    });
+    expect(
+      await db.smsStatusEvent.findUnique({
+        where: {
+          providerKey_providerEventId: {
+            providerKey,
+            providerEventId: `${prefix}-reconcilable-event`,
+          },
+        },
+      }),
+    ).toMatchObject({ messageId: fixture.messageId });
+    expect(
+      await db.smsStatusEvent.findUnique({
+        where: {
+          providerKey_providerEventId: {
+            providerKey,
+            providerEventId: `${prefix}-permanent-orphan`,
+          },
+        },
+      }),
+    ).toMatchObject({ messageId: null });
   });
 });

@@ -128,18 +128,33 @@ export async function commitSmsImport(input: CommitSmsImportInput) {
           suppressedCount: batch.suppressedCount,
           smsTemplateVersionId: templateVersion.id,
           smsProviderKey: env.SMS_PROVIDER,
+          smsSenderRef:
+            env.SMS_PROVIDER.toLowerCase() === "twilio"
+              ? env.TWILIO_MESSAGING_SERVICE_SID
+              : undefined,
+          smsProviderConfig:
+            env.SMS_PROVIDER.toLowerCase() === "twilio" &&
+            env.TWILIO_MESSAGING_SERVICE_SID
+              ? {
+                  routing: "messaging_service",
+                  messagingServiceSid: env.TWILIO_MESSAGING_SERVICE_SID,
+                }
+              : undefined,
           smsScheduleTimezone: input.timezone,
           smsScheduledFor: input.scheduledFor,
           smsSendWindowStartMinutes: input.sendWindowStartMinutes,
           smsSendWindowEndMinutes: input.sendWindowEndMinutes,
           smsEstimatedCostPerSegmentMicros:
-            settings.sms_cost_per_segment_micros,
+            settings.sms_cost_per_segment_micros +
+            settings.sms_carrier_surcharge_per_outbound_segment_micros,
           smsCostConfig: {
             fixedMonthlyProviderFeeCents:
               settings.sms_provider_fixed_monthly_fee_cents,
             costPerOutboundMessageMicros:
               settings.sms_cost_per_outbound_message_micros,
             costPerSegmentMicros: settings.sms_cost_per_segment_micros,
+            carrierSurchargePerOutboundSegmentMicros:
+              settings.sms_carrier_surcharge_per_outbound_segment_micros,
             costPerInboundMessageMicros:
               settings.sms_cost_per_inbound_message_micros,
             phoneNumberMonthlyCostCents:

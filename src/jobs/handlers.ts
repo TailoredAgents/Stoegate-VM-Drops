@@ -3,7 +3,11 @@ import type { Job } from "pg-boss";
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { getEnv } from "@/lib/env";
-import { withSmsDispatchLock } from "@/lib/sms-dispatch-lock";
+import { isProviderOptOutSignal } from "@/lib/provider-suppression";
+import {
+  lockSmsCampaignDispatchTx,
+  withSmsDispatchLock,
+} from "@/lib/sms-dispatch-lock";
 import {
   ensureSmsSequenceTx,
   markSmsSuppressedBeforeSend,
@@ -18,10 +22,15 @@ import {
   SmsAttemptDeferredError,
 } from "@/lib/sms-operations";
 import { prepareSmsMessage } from "@/lib/sms";
+import { initialOutboundFromPhone } from "@/lib/sms-provider-routing";
 import {
   reconcileSynchronousSmsProviderResults,
   reconcileUnmatchedSmsStatusEvents,
 } from "@/lib/sms-webhooks";
+import {
+  suppressPhoneGlobally,
+  suppressPhoneGloballyWhileDispatchLocked,
+} from "@/lib/suppression";
 import { sha256 } from "@/lib/utils";
 import { getSmsProvider } from "@/providers";
 import { enqueuePrepareCampaign, enqueueSendSms } from "./queues";
@@ -117,9 +126,12 @@ function campaignCost(campaign: {
   smsEstimatedCostPerSegmentMicros: number;
 }) {
   const config = recordValue(campaign.smsCostConfig);
+  const configuredSegmentMicros =
+    nonNegativeNumber(config.costPerSegmentMicros) +
+    nonNegativeNumber(config.carrierSurchargePerOutboundSegmentMicros);
   return {
     costPerSegmentCents:
-      nonNegativeNumber(config.costPerSegmentMicros) / 10_000 ||
+      configuredSegmentMicros / 10_000 ||
       campaign.smsEstimatedCostPerSegmentMicros / 10_000,
     fixedCostPerMessageCents:
       nonNegativeNumber(config.costPerOutboundMessageMicros) / 10_000,
@@ -205,10 +217,6 @@ async function prepareBulk(campaignId: string) {
     return;
   if (!campaign.smsTemplateVersion)
     throw new Error("Campaign has no SMS template version");
-  await db.campaign.update({
-    where: { id: campaign.id },
-    data: { status: "SENDING", pausedAt: null },
-  });
 
   const alreadySelected = await db.campaignContact.count({
     where: { campaignId, selectedForSend: true },
@@ -247,6 +255,11 @@ async function prepareBulk(campaignId: string) {
     },
   });
   const startAt = campaign.smsScheduledFor ?? new Date();
+  const messageProviderKey = campaign.smsProviderKey ?? getEnv().SMS_PROVIDER;
+  const messagesToEnqueue: Array<{
+    id: string;
+    scheduledFor: Date | null;
+  }> = [];
   for (const contact of contacts) {
     let messageId = contact.outboundMessages[0]?.id;
     if (!messageId) {
@@ -269,7 +282,7 @@ async function prepareBulk(campaignId: string) {
           where: { campaignContactId: contact.id },
           create: {
             campaignContactId: contact.id,
-            providerKey: campaign.smsProviderKey ?? getEnv().SMS_PROVIDER,
+            providerKey: messageProviderKey,
           },
           update: {},
         });
@@ -289,11 +302,14 @@ async function prepareBulk(campaignId: string) {
             sequenceNumber: 1,
             idempotencyKey: `sms:${campaign.id}:${contact.id}:1`,
             toPhone: contact.contact.normalizedPhone,
-            fromPhone: campaign.smsSenderRef,
+            fromPhone: initialOutboundFromPhone(
+              messageProviderKey,
+              campaign.smsSenderRef,
+            ),
             renderedBody: prepared.body,
             bodyHash: sha256(prepared.body),
             segmentCount: prepared.segments.segmentCount,
-            providerKey: campaign.smsProviderKey ?? getEnv().SMS_PROVIDER,
+            providerKey: messageProviderKey,
             status: "QUEUED",
             estimatedCostMicros,
             currency: campaign.smsCurrency,
@@ -346,15 +362,45 @@ async function prepareBulk(campaignId: string) {
       existing &&
       ["PENDING", "SCHEDULED", "QUEUED"].includes(existing.status)
     )
-      await enqueueSendSms(
-        campaign.id,
-        messageId,
-        existing.scheduledFor && existing.scheduledFor > new Date()
-          ? existing.scheduledFor
-          : undefined,
-      );
+      messagesToEnqueue.push({
+        id: messageId,
+        scheduledFor: existing.scheduledFor,
+      });
   }
-  if (!contacts.length) await maybeCompleteCampaign(campaign.id);
+
+  // QUEUED is the durable "still preparing" state. Only expose SENDING after
+  // every selected outbound row exists, so a fast send cannot complete a
+  // partially staged campaign. The dispatch lock also prevents a stale prepare
+  // job from undoing a concurrent pause.
+  const sendable = await db.$transaction(
+    async (tx) => {
+      await lockSmsCampaignDispatchTx(tx, campaign.id);
+      const current = await tx.campaign.findUnique({
+        where: { id: campaign.id },
+        select: { status: true },
+      });
+      if (!current || !["QUEUED", "SENDING"].includes(current.status))
+        return false;
+      if (current.status === "QUEUED")
+        await tx.campaign.update({
+          where: { id: campaign.id },
+          data: { status: "SENDING", pausedAt: null },
+        });
+      return true;
+    },
+    { maxWait: 10_000, timeout: 60_000 },
+  );
+  if (!sendable) return;
+
+  for (const message of messagesToEnqueue)
+    await enqueueSendSms(
+      campaign.id,
+      message.id,
+      message.scheduledFor && message.scheduledFor > new Date()
+        ? message.scheduledFor
+        : undefined,
+    );
+  await maybeCompleteCampaign(campaign.id);
 }
 
 export async function handlePrepareCampaign(job: Job<unknown>) {
@@ -413,6 +459,16 @@ export async function handleSendSms(job: Job<unknown>) {
       include: { campaignContact: { include: { campaign: true } } },
     });
     const campaign = message.campaignContact.campaign;
+    if (isProviderOptOutSignal(message.providerKey ?? "", message.errorCode)) {
+      await suppressPhoneGlobally({
+        normalizedPhone: message.toPhone,
+        reason: "PROVIDER_DNC",
+        source: "twilio_provider_opt_out",
+        notes: "Twilio rejected messaging because the recipient opted out.",
+        occurredAt: message.failedAt ?? new Date(),
+        idempotencyKey: `twilio-provider-opt-out:${message.id}:${message.errorCode}`,
+      });
+    }
     if (campaign.status === "PAUSED" || campaign.status === "SCHEDULED") {
       await recordJobFinish(job);
       return;
@@ -420,6 +476,7 @@ export async function handleSendSms(job: Job<unknown>) {
     if (campaign.kind !== "SMS" || campaign.status !== "SENDING")
       throw new Error(`SMS campaign is not sendable (${campaign.status})`);
     if (!["PENDING", "SCHEDULED", "QUEUED"].includes(message.status)) {
+      await maybeCompleteCampaign(campaign.id);
       await recordJobFinish(job);
       return;
     }
@@ -440,6 +497,7 @@ export async function handleSendSms(job: Job<unknown>) {
       let stopAfterDispatchLock = false;
       await withSmsDispatchLock(
         {
+          providerKey: provider.name,
           campaignId: campaign.id,
           normalizedPhone: message.toPhone,
         },
@@ -450,6 +508,7 @@ export async function handleSendSms(job: Job<unknown>) {
               reservation = await reserveLiveSmsAttempt({
                 messageId: message.id,
                 occurredAt: new Date(),
+                readinessLockAlreadyHeld: true,
               });
             } catch (error) {
               if (error instanceof SmsAttemptDeferredError) {
@@ -473,11 +532,16 @@ export async function handleSendSms(job: Job<unknown>) {
             const result = await provider.send({
               idempotencyKey: reservation.idempotencyKey,
               to: reservation.message.toPhone,
-              from: reservation.message.fromPhone,
+              from:
+                reservation.providerKey.toLowerCase() === "twilio"
+                  ? undefined
+                  : (reservation.message.fromPhone ?? undefined),
               body: reservation.message.renderedBody,
               clientReference: reservation.message.id,
               callbackUrl: new URL(
-                "/api/webhooks/sms",
+                reservation.providerKey.toLowerCase() === "twilio"
+                  ? "/api/webhooks/twilio/status"
+                  : "/api/webhooks/sms",
                 getEnv().APP_BASE_URL,
               ).toString(),
               metadata: {
@@ -514,10 +578,28 @@ export async function handleSendSms(job: Job<unknown>) {
               providerResponse: result.rawResponse,
               actualSegmentCount: result.segments,
               actualCostMicros: result.costMicros,
+              currency: result.currency,
+              fromPhone: result.from,
               errorCode: result.failureCode,
               errorMessage: result.failureReason,
               occurredAt: providerResultAt,
             });
+            if (
+              isProviderOptOutSignal(
+                reservation.providerKey,
+                result.failureCode,
+              )
+            ) {
+              await suppressPhoneGloballyWhileDispatchLocked({
+                normalizedPhone: reservation.message.toPhone,
+                reason: "PROVIDER_DNC",
+                source: "twilio_provider_opt_out",
+                notes:
+                  "Twilio rejected messaging because the recipient opted out.",
+                occurredAt: providerResultAt,
+                idempotencyKey: `twilio-provider-opt-out:${message.id}:${result.failureCode}`,
+              });
+            }
             if (synchronousDeliveryOutcome) {
               if (!result.providerMessageId)
                 throw new Error(
@@ -533,6 +615,8 @@ export async function handleSendSms(job: Job<unknown>) {
                 rawPayload: result.rawResponse,
                 actualSegmentCount: result.segments,
                 actualCostMicros: result.costMicros,
+                currency: result.currency,
+                fromPhone: result.from,
                 errorCode: result.failureCode,
                 errorMessage: result.failureReason,
                 occurredAt: providerResultAt,
@@ -558,7 +642,10 @@ export async function handleSendSms(job: Job<unknown>) {
           }
         },
       );
-      if (stopAfterDispatchLock) return;
+      if (stopAfterDispatchLock) {
+        await maybeCompleteCampaign(campaign.id);
+        return;
+      }
     } else {
       const result = await provider.send({
         idempotencyKey: message.idempotencyKey,
@@ -648,20 +735,26 @@ export async function handleReconcileOutreach(job: Job<unknown>) {
 }
 
 export async function maybeCompleteCampaign(campaignId: string) {
-  const campaign = await db.campaign.findUnique({
-    where: { id: campaignId },
-    select: { status: true },
-  });
-  if (!campaign || campaign.status !== "SENDING") return;
-  const active = await db.smsOutboundMessage.count({
-    where: {
-      campaignContact: { campaignId },
-      status: { in: ["PENDING", "SCHEDULED", "QUEUED", "SUBMITTING"] },
+  await db.$transaction(
+    async (tx) => {
+      await lockSmsCampaignDispatchTx(tx, campaignId);
+      const campaign = await tx.campaign.findUnique({
+        where: { id: campaignId },
+        select: { status: true },
+      });
+      if (!campaign || campaign.status !== "SENDING") return;
+      const active = await tx.smsOutboundMessage.count({
+        where: {
+          campaignContact: { campaignId },
+          status: { in: ["PENDING", "SCHEDULED", "QUEUED", "SUBMITTING"] },
+        },
+      });
+      if (active === 0)
+        await tx.campaign.updateMany({
+          where: { id: campaignId, status: "SENDING" },
+          data: { status: "COMPLETED", completedAt: new Date() },
+        });
     },
-  });
-  if (active === 0)
-    await db.campaign.update({
-      where: { id: campaignId },
-      data: { status: "COMPLETED", completedAt: new Date() },
-    });
+    { maxWait: 10_000, timeout: 60_000 },
+  );
 }

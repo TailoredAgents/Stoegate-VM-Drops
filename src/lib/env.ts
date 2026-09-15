@@ -5,6 +5,14 @@ const booleanString = z
   .default("false")
   .transform((value) => value === "true");
 
+function optionalEnvironmentValue<T extends z.ZodType>(schema: T) {
+  return z.preprocess(
+    (value) =>
+      typeof value === "string" && value.trim() === "" ? undefined : value,
+    schema.optional(),
+  );
+}
+
 const envSchema = z
   .object({
     NODE_ENV: z
@@ -18,8 +26,25 @@ const envSchema = z
     ADMIN_PASSWORD: z.string().min(12).optional(),
     ADMIN_PASSWORD_HASH: z.string().optional(),
     SMS_LIVE_SENDS_ENABLED: booleanString,
-    SMS_PROVIDER: z.string().trim().min(1).default("dry-run"),
+    SMS_PROVIDER: z.string().trim().toLowerCase().min(1).default("dry-run"),
     SMS_PROVIDER_WEBHOOK_SECRET: z.string().min(24).optional(),
+    TWILIO_ACCOUNT_SID: optionalEnvironmentValue(
+      z
+        .string()
+        .trim()
+        .regex(/^AC[0-9a-fA-F]{32}$/, "Must be a valid Twilio Account SID"),
+    ),
+    TWILIO_AUTH_TOKEN: optionalEnvironmentValue(z.string().trim().min(1)),
+    TWILIO_MESSAGING_SERVICE_SID: optionalEnvironmentValue(
+      z
+        .string()
+        .trim()
+        .regex(
+          /^MG[0-9a-fA-F]{32}$/,
+          "Must be a valid Twilio Messaging Service SID",
+        ),
+    ),
+    TWILIO_PRODUCTION_APPROVED: booleanString,
     DEFAULT_DAILY_SMS_LIMIT: z.coerce
       .number()
       .int()
@@ -50,14 +75,36 @@ const envSchema = z
   })
   .superRefine((env, ctx) => {
     if (!env.SMS_LIVE_SENDS_ENABLED) return;
-    if (env.SMS_PROVIDER.toLowerCase() === "dry-run") {
+    const provider = env.SMS_PROVIDER.toLowerCase();
+    if (provider === "dry-run") {
       ctx.addIssue({
         code: "custom",
         path: ["SMS_PROVIDER"],
         message: "A production SMS provider must be implemented and selected",
       });
     }
-    if (!env.SMS_PROVIDER_WEBHOOK_SECRET) {
+    if (provider === "twilio") {
+      if (!env.TWILIO_PRODUCTION_APPROVED) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["TWILIO_PRODUCTION_APPROVED"],
+          message: "Twilio production sending must be explicitly approved",
+        });
+      }
+      for (const key of [
+        "TWILIO_ACCOUNT_SID",
+        "TWILIO_AUTH_TOKEN",
+        "TWILIO_MESSAGING_SERVICE_SID",
+      ] as const) {
+        if (!env[key]) {
+          ctx.addIssue({
+            code: "custom",
+            path: [key],
+            message: `${key} is required for live Twilio sending`,
+          });
+        }
+      }
+    } else if (!env.SMS_PROVIDER_WEBHOOK_SECRET) {
       ctx.addIssue({
         code: "custom",
         path: ["SMS_PROVIDER_WEBHOOK_SECRET"],

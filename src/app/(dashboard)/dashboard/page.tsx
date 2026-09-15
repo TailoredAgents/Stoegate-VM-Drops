@@ -36,6 +36,64 @@ export default async function DashboardPage() {
     getTodayOperations(),
     getOutreachFunnel(),
   ]);
+  const economicsRows: Array<{
+    label: string;
+    value: number | null;
+    requiresComparableProviderCost?: boolean;
+  }> = [
+    {
+      label: "Current variable SMS spend",
+      value: metrics.totalCostCents,
+      requiresComparableProviderCost: true,
+    },
+    {
+      label: "Configured fixed monthly run-rate",
+      value: metrics.configuredFixedMonthlyCents,
+    },
+    {
+      label: "Cost / sent",
+      value: metrics.costPerSentCents,
+      requiresComparableProviderCost: true,
+    },
+    {
+      label: "Cost / delivered",
+      value: metrics.costPerDeliveredCents,
+      requiresComparableProviderCost: true,
+    },
+    {
+      label: "Cost / reply",
+      value: metrics.costPerReplyCents,
+      requiresComparableProviderCost: true,
+    },
+    {
+      label: "Cost / interested seller",
+      value: metrics.costPerInterestedCents,
+      requiresComparableProviderCost: true,
+    },
+    {
+      label: "Cost / qualified lead",
+      value: metrics.costPerQualifiedLeadCents,
+      requiresComparableProviderCost: true,
+    },
+    {
+      label: "Cost / contract",
+      value: metrics.costPerContractCents,
+      requiresComparableProviderCost: true,
+    },
+    {
+      label: "Cost / closed deal",
+      value: metrics.costPerClosedDealCents,
+      requiresComparableProviderCost: true,
+    },
+    {
+      label: "VA benchmark / qualified lead",
+      value: metrics.vaCostPerQualifiedLeadCents,
+    },
+    {
+      label: "VA expected labor / deal",
+      value: metrics.vaExpectedLaborCostPerDealCents,
+    },
+  ];
 
   return (
     <>
@@ -143,8 +201,18 @@ export default async function DashboardPage() {
         />
         <MetricCard
           label="SMS variable cost"
-          value={formatCents(metrics.totalCostCents)}
-          detail={`${formatCents(metrics.configuredFixedMonthlyCents)}/mo fixed run-rate`}
+          value={
+            metrics.costsComparable && metrics.totalCostCents !== null
+              ? formatCents(metrics.totalCostCents)
+              : "Unavailable"
+          }
+          detail={
+            metrics.costsComparable
+              ? `${formatCents(metrics.configuredFixedMonthlyCents)}/mo fixed run-rate`
+              : metrics.hasMixedCurrencies
+                ? "Multiple currencies; no FX conversion applied"
+                : `${metrics.currency} provider cost cannot be combined with USD settings`
+          }
           icon={BadgeDollarSign}
         />
       </section>
@@ -287,35 +355,19 @@ export default async function DashboardPage() {
         <div>
           <h2 className="mb-3 text-lg font-bold">Unit economics</h2>
           <div className="card divide-y divide-slate-100 px-5">
-            {[
-              ["Current variable SMS spend", metrics.totalCostCents],
-              [
-                "Configured fixed monthly run-rate",
-                metrics.configuredFixedMonthlyCents,
-              ],
-              ["Cost / sent", metrics.costPerSentCents],
-              ["Cost / delivered", metrics.costPerDeliveredCents],
-              ["Cost / reply", metrics.costPerReplyCents],
-              ["Cost / interested seller", metrics.costPerInterestedCents],
-              ["Cost / qualified lead", metrics.costPerQualifiedLeadCents],
-              ["Cost / contract", metrics.costPerContractCents],
-              ["Cost / closed deal", metrics.costPerClosedDealCents],
-              [
-                "VA benchmark / qualified lead",
-                metrics.vaCostPerQualifiedLeadCents,
-              ],
-              [
-                "VA expected labor / deal",
-                metrics.vaExpectedLaborCostPerDealCents,
-              ],
-            ].map(([label, value]) => (
+            {economicsRows.map((row) => (
               <div
                 className="flex items-center justify-between gap-4 py-3"
-                key={String(label)}
+                key={row.label}
               >
-                <span className="text-sm text-slate-600">{label}</span>
+                <span className="text-sm text-slate-600">{row.label}</span>
                 <strong className="text-sm">
-                  {money(value == null ? null : Number(value))}
+                  {money(
+                    row.requiresComparableProviderCost &&
+                      !metrics.costsComparable
+                      ? null
+                      : row.value,
+                  )}
                 </strong>
               </div>
             ))}
@@ -325,7 +377,9 @@ export default async function DashboardPage() {
             cost replaces that message&apos;s estimate when available; no
             carrier price is hardcoded. Fixed monthly fees are shown separately
             and are not allocated into per-result costs without an explicit
-            allocation policy.
+            allocation policy. Mixed or non-USD provider costs stay recorded,
+            but combined unit economics remain unavailable until an FX policy is
+            configured.
           </p>
         </div>
       </section>

@@ -9,9 +9,8 @@ reply tracking, attributed outcomes, cold-call handoff, and operational
 reporting.
 
 It is not a conversational calling agent, a human dialer, or a general CRM.
-Production SMS transport is intentionally out of scope until Stonegate selects
-a provider and completes the required technical, operational, and legal
-review.
+Twilio production transport is technically prepared but remains locked until
+Stonegate completes the required account, A2P, operational, and legal review.
 
 ## Migration status
 
@@ -33,11 +32,12 @@ The previous implementation is retained at `archive/rvm-v1`; see
   idempotency keys are persisted. A restart must not lose scheduled work or
   duplicate a confirmed send.
 - **SMS boundary:** campaign logic depends on a provider-neutral interface.
-  `dry-run` is the only selected adapter until a separate provider decision is
-  completed.
-- **Safety switches:** live sending requires both a future production-capable
-  adapter and `SMS_LIVE_SENDS_ENABLED=true`. Checked-in configuration keeps the
-  switch false.
+  `dry-run` remains the default; Twilio Messaging Service routing is the first
+  gated production adapter.
+- **Safety switches:** live Twilio sending requires
+  `SMS_LIVE_SENDS_ENABLED=true`, `TWILIO_PRODUCTION_APPROVED=true`, a fresh
+  passing diagnostic, and a current audited admin acknowledgement. Checked-in
+  configuration keeps both environment switches false.
 - **Limits:** the application enforces a normal daily target separately from
   environment-only campaign and daily live ceilings.
 - **Eligibility timing:** only a confirmed SMS send may snapshot the
@@ -68,14 +68,13 @@ The previous implementation is retained at `archive/rvm-v1`; see
 5. **Complete:** prove list import, campaign review, dry-run execution, restart
    safety, idempotency, outcome import, and export behavior with focused and
    PostgreSQL integration tests.
-6. **Pending provider decision:** evaluate candidate SMS providers against the
-   decision record. Select one
-   only after current official documentation and account-specific behavior have
-   been verified.
-7. **Blocked on step 6:** implement the selected provider adapter,
-   provider-specific webhook mapping/authentication, rate limiting, and
-   diagnostics against the existing canonical webhook/reconciliation layer.
-8. **Blocked on steps 6-7:** complete operational and legal review, then run a
+6. **Complete:** select Twilio Messaging Services and review the official send,
+   callback, inbound webhook, signature, and A2P contracts.
+7. **Complete:** implement the Twilio adapter, native signed webhooks, read-only
+   diagnostics, cost reconciliation support, and independent approval gate
+   against the existing domain.
+8. **Pending external approval:** complete Twilio account/A2P, operational, and
+   legal review, then run a
    deliberately limited live acceptance campaign before raising either hard
    ceiling.
 
@@ -84,14 +83,15 @@ The previous implementation is retained at `archive/rvm-v1`; see
 ```text
 SMS_LIVE_SENDS_ENABLED=false
 SMS_PROVIDER=dry-run
+TWILIO_PRODUCTION_APPROVED=false
 DEFAULT_DAILY_SMS_LIMIT=2000
 MAX_LIVE_SMS_CAMPAIGN_LIMIT=10
 MAX_LIVE_DAILY_SMS_LIMIT=10
 DEFAULT_SMS_TO_COLD_CALL_DELAY_HOURS=48
 ```
 
-No production provider credential belongs in the repository. Provider-specific
-variables are added only with the selected adapter and its reviewed runbook.
+No production provider credential belongs in the repository. Twilio credential
+names and blank placeholders are documented; real values remain secret.
 
 ## Operational safeguards
 
@@ -113,10 +113,10 @@ variables are added only with the selected adapter and its reviewed runbook.
   per-contact errors rather than one unbounded campaign transaction.
 - Render disk is ephemeral and is not a source of campaign or export state.
 
-## Provider decision gate
+## Twilio account gate
 
-Provider selection remains unfinished. Before implementation, document and
-test at least:
+The adapter decision is complete. Before live acceptance, verify with the real
+approved account:
 
 - outbound API authentication and idempotency behavior;
 - message and sender registration requirements;
@@ -127,7 +127,9 @@ test at least:
 - account-specific pricing and reporting fields;
 - sandbox/test-number support and production activation steps.
 
-No provider should be described as selected until these checks are complete.
+Twilio is the selected adapter, but it must not be described as production
+approved or ready until these live-account checks and the application gates are
+complete.
 
 ## Live-readiness gate
 

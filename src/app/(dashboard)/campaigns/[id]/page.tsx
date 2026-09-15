@@ -49,6 +49,7 @@ export default async function CampaignDetailPage({
     coldCallExported,
     actualCosts,
     estimatedCosts,
+    costCurrencies,
     env,
   ] = await Promise.all([
     db.campaign.findFirst({
@@ -131,6 +132,17 @@ export default async function CampaignDetailPage({
       },
       _sum: { estimatedCostMicros: true },
     }),
+    db.smsOutboundMessage.groupBy({
+      by: ["currency"],
+      where: {
+        campaignContact: { campaignId: id },
+        OR: [
+          { actualCostMicros: { not: null } },
+          { actualCostMicros: null, estimatedCostMicros: { gt: 0 } },
+        ],
+      },
+      _count: { _all: true },
+    }),
     getEnv(),
   ]);
   if (!campaign) notFound();
@@ -146,19 +158,32 @@ export default async function CampaignDetailPage({
     campaign.smsCostConfig,
     "costPerOutboundMessageMicros",
   );
-  const segmentMicros = numericJson(
+  const baseSegmentMicros = numericJson(
     campaign.smsCostConfig,
     "costPerSegmentMicros",
-    campaign.smsEstimatedCostPerSegmentMicros,
   );
+  const surchargeSegmentMicros = numericJson(
+    campaign.smsCostConfig,
+    "carrierSurchargePerOutboundSegmentMicros",
+  );
+  const segmentMicros =
+    baseSegmentMicros + surchargeSegmentMicros ||
+    campaign.smsEstimatedCostPerSegmentMicros;
   const plannedCount = Math.min(campaign.eligibleCount, campaign.sendLimit);
   const plannedVariableCostCents =
     (plannedCount * (outboundMessageMicros + avgSegments * segmentMicros)) /
     10_000;
-  const recordedVariableCostCents =
-    ((actualCosts._sum.actualCostMicros ?? 0) +
-      (estimatedCosts._sum.estimatedCostMicros ?? 0)) /
-    10_000;
+  const recordedCurrency =
+    costCurrencies.length === 0
+      ? campaign.smsCurrency
+      : costCurrencies.length === 1
+        ? costCurrencies[0].currency
+        : null;
+  const recordedVariableCostCents = recordedCurrency
+    ? ((actualCosts._sum.actualCostMicros ?? 0) +
+        (estimatedCosts._sum.estimatedCostMicros ?? 0)) /
+      10_000
+    : null;
 
   return (
     <>
@@ -194,7 +219,7 @@ export default async function CampaignDetailPage({
             Planned variable cost
           </p>
           <p className="text-xl font-bold">
-            {formatCents(plannedVariableCostCents)}
+            {formatCents(plannedVariableCostCents, campaign.smsCurrency)}
           </p>
         </div>
       </div>
@@ -220,8 +245,16 @@ export default async function CampaignDetailPage({
         />
         <MetricCard
           label="Recorded SMS cost"
-          value={formatCents(recordedVariableCostCents)}
-          detail={`${failed.toLocaleString()} failed or undelivered`}
+          value={
+            recordedVariableCostCents === null
+              ? "Mixed currencies"
+              : formatCents(recordedVariableCostCents, recordedCurrency!)
+          }
+          detail={
+            recordedVariableCostCents === null
+              ? "No FX conversion applied"
+              : `${failed.toLocaleString()} failed or undelivered`
+          }
           icon={BadgeDollarSign}
         />
       </section>
@@ -320,7 +353,10 @@ export default async function CampaignDetailPage({
           eligible={campaign.eligibleCount}
           sendLimit={campaign.sendLimit}
           dailyCap={campaign.smsDailyCap}
-          estimatedCost={formatCents(plannedVariableCostCents)}
+          estimatedCost={formatCents(
+            plannedVariableCostCents,
+            campaign.smsCurrency,
+          )}
           liveSms={env.SMS_LIVE_SENDS_ENABLED}
         />
       </section>

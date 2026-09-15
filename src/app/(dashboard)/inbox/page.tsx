@@ -69,78 +69,102 @@ export default async function SmsInboxPage({
     },
   };
 
-  const [conversations, total, campaigns, states, counties] = await Promise.all(
-    [
-      db.smsConversation.findMany({
-        where,
-        orderBy: [
-          { lastMessageAt: { sort: "desc", nulls: "last" } },
-          { createdAt: "desc" },
-        ],
-        skip: (page - 1) * pageSize,
-        take: pageSize,
-        include: {
-          campaignContact: {
-            include: {
-              campaign: { select: { id: true, name: true } },
-              contact: {
-                include: {
-                  suppressions: {
-                    select: { id: true, reason: true, createdAt: true },
-                  },
+  const [
+    conversations,
+    total,
+    unmatchedReplies,
+    unmatchedTotal,
+    campaigns,
+    states,
+    counties,
+  ] = await Promise.all([
+    db.smsConversation.findMany({
+      where,
+      orderBy: [
+        { lastMessageAt: { sort: "desc", nulls: "last" } },
+        { createdAt: "desc" },
+      ],
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+      include: {
+        campaignContact: {
+          include: {
+            campaign: { select: { id: true, name: true } },
+            contact: {
+              include: {
+                suppressions: {
+                  select: { id: true, reason: true, createdAt: true },
                 },
               },
-              property: true,
-              outreachSequence: true,
-              leadAttribution: true,
             },
-          },
-          outboundMessages: {
-            orderBy: [{ sequenceNumber: "asc" }, { createdAt: "asc" }],
-            take: 1,
-          },
-          inboundMessages: {
-            ...(classification ? { where: { classification } } : {}),
-            orderBy: { receivedAt: "desc" },
-            take: replyPreviewLimit,
-            include: {
-              classifiedBy: { select: { email: true } },
-            },
-          },
-          _count: {
-            select: {
-              inboundMessages: classification
-                ? { where: { classification } }
-                : true,
-            },
+            property: true,
+            outreachSequence: true,
+            leadAttribution: true,
           },
         },
-      }),
-      db.smsConversation.count({ where }),
-      db.campaign.findMany({
-        where: { kind: "SMS" },
-        orderBy: { name: "asc" },
-        select: { id: true, name: true },
-      }),
-      db.property.findMany({
-        where: { state: { not: null } },
-        distinct: ["state"],
-        orderBy: { state: "asc" },
-        select: { state: true },
-      }),
-      db.property.findMany({
-        where: {
-          county: { not: null },
-          ...(state
-            ? { state: { equals: state, mode: "insensitive" as const } }
-            : {}),
+        outboundMessages: {
+          orderBy: [{ sequenceNumber: "asc" }, { createdAt: "asc" }],
+          take: 1,
         },
-        distinct: ["county"],
-        orderBy: { county: "asc" },
-        select: { county: true },
-      }),
-    ],
-  );
+        inboundMessages: {
+          ...(classification ? { where: { classification } } : {}),
+          orderBy: { receivedAt: "desc" },
+          take: replyPreviewLimit,
+          include: {
+            classifiedBy: { select: { email: true } },
+          },
+        },
+        _count: {
+          select: {
+            inboundMessages: classification
+              ? { where: { classification } }
+              : true,
+          },
+        },
+      },
+    }),
+    db.smsConversation.count({ where }),
+    db.smsInboundMessage.findMany({
+      where: {
+        campaignContactId: null,
+        ...(classification ? { classification } : {}),
+      },
+      orderBy: { receivedAt: "desc" },
+      take: pageSize,
+      include: {
+        contact: true,
+        classifiedBy: { select: { email: true } },
+      },
+    }),
+    db.smsInboundMessage.count({
+      where: {
+        campaignContactId: null,
+        ...(classification ? { classification } : {}),
+      },
+    }),
+    db.campaign.findMany({
+      where: { kind: "SMS" },
+      orderBy: { name: "asc" },
+      select: { id: true, name: true },
+    }),
+    db.property.findMany({
+      where: { state: { not: null } },
+      distinct: ["state"],
+      orderBy: { state: "asc" },
+      select: { state: true },
+    }),
+    db.property.findMany({
+      where: {
+        county: { not: null },
+        ...(state
+          ? { state: { equals: state, mode: "insensitive" as const } }
+          : {}),
+      },
+      distinct: ["county"],
+      orderBy: { county: "asc" },
+      select: { county: true },
+    }),
+  ]);
 
   const campaignSuppressions = conversations.length
     ? await db.campaignSuppression.findMany({
@@ -178,7 +202,8 @@ export default async function SmsInboxPage({
             {total.toLocaleString()} conversation
             {total === 1 ? "" : "s"} with inbound replies. Any reply stops later
             campaign outreach; opt-outs and wrong numbers suppress the phone
-            globally.
+            globally. {unmatchedTotal.toLocaleString()} unmatched or ambiguous
+            repl{unmatchedTotal === 1 ? "y" : "ies"} await operator review.
           </p>
         </div>
         <span className="text-xs font-semibold text-slate-500">
@@ -251,6 +276,72 @@ export default async function SmsInboxPage({
           <Filter className="h-4 w-4" /> Filter
         </button>
       </form>
+
+      {unmatchedReplies.length ? (
+        <section className="mt-6">
+          <div className="mb-3">
+            <h2 className="font-bold">Unmatched / ambiguous replies</h2>
+            <p className="mt-1 text-sm text-slate-500">
+              No campaign or property was guessed. These replies remain in the
+              inbox for manual classification; phone-wide opt-outs are already
+              enforced.
+            </p>
+          </div>
+          <div className="space-y-3">
+            {unmatchedReplies.map((message) => (
+              <article className="card p-5" key={message.id}>
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div>
+                    <p className="font-semibold text-slate-900">
+                      {message.contact?.ownerName ||
+                        message.contact?.firstName ||
+                        message.fromPhone}
+                    </p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {message.fromPhone} → {message.toPhone} · received{" "}
+                      {message.receivedAt.toLocaleString()}
+                      {message.classifiedBy
+                        ? ` · classified by ${message.classifiedBy.email}`
+                        : ""}
+                    </p>
+                  </div>
+                  <StatusBadge status={message.classification} />
+                </div>
+                <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-slate-800">
+                  {message.body || "(empty reply or media-only message)"}
+                </p>
+                <form
+                  action={classifySmsInboundMessageAction}
+                  className="mt-3 flex flex-wrap gap-2"
+                >
+                  <input type="hidden" name="messageId" value={message.id} />
+                  <select
+                    className="input min-w-48 flex-1"
+                    name="classification"
+                    defaultValue={message.classification}
+                    aria-label={`Classify unmatched reply from ${message.fromPhone}`}
+                  >
+                    {SMS_INBOUND_CLASSIFICATIONS.map((value) => (
+                      <option key={value} value={value}>
+                        {value.replaceAll("_", " ")}
+                      </option>
+                    ))}
+                  </select>
+                  <button className="btn-secondary" type="submit">
+                    Save classification
+                  </button>
+                </form>
+              </article>
+            ))}
+          </div>
+          {unmatchedTotal > unmatchedReplies.length ? (
+            <p className="mt-3 text-xs text-slate-500">
+              Showing the {unmatchedReplies.length.toLocaleString()} newest of{" "}
+              {unmatchedTotal.toLocaleString()} unmatched replies.
+            </p>
+          ) : null}
+        </section>
+      ) : null}
 
       <section className="mt-6 space-y-4">
         {conversations.map((conversation) => {

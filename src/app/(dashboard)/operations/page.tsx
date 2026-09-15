@@ -4,6 +4,7 @@ import {
   type SmsMessageStatus,
 } from "@prisma/client";
 import {
+  AlertTriangle,
   Download,
   Filter,
   Inbox,
@@ -203,6 +204,7 @@ export default async function OperationsPage({
     awaitingExport,
     exportedToday,
     unclassifiedReplies,
+    twilioFailureBreakdown,
     exportPreview,
     exports,
   ] = await Promise.all([
@@ -218,6 +220,9 @@ export default async function OperationsPage({
         outboundMessages: {
           orderBy: { sequenceNumber: "desc" },
           take: 1,
+          include: {
+            attempts: { orderBy: { attemptNumber: "desc" }, take: 1 },
+          },
         },
         inboundMessages: { orderBy: { receivedAt: "desc" }, take: 1 },
         outreachSequence: true,
@@ -321,7 +326,20 @@ export default async function OperationsPage({
       },
       _sum: { itemCount: true },
     }),
-    db.smsInboundMessage.count({ where: { classification: "UNCLASSIFIED" } }),
+    db.smsInboundMessage.count({
+      where: { classification: { in: ["UNCLASSIFIED", "NEEDS_REVIEW"] } },
+    }),
+    db.smsOutboundMessage.groupBy({
+      by: ["errorCode"],
+      where: {
+        providerKey: "twilio",
+        status: { in: ["UNDELIVERED", "FAILED"] },
+        errorCode: { not: null },
+      },
+      _count: { _all: true },
+      orderBy: { _count: { errorCode: "desc" } },
+      take: 10,
+    }),
     previewOutreachExport({
       type: "BATCH_DIALER",
       campaignId,
@@ -376,7 +394,7 @@ export default async function OperationsPage({
         </div>
         <Link className="btn-secondary" href="/inbox">
           <Inbox className="h-4 w-4" /> Review{" "}
-          {unclassifiedReplies.toLocaleString()} unclassified
+          {unclassifiedReplies.toLocaleString()} unreviewed
         </Link>
       </div>
 
@@ -539,6 +557,36 @@ export default async function OperationsPage({
         </button>
       </form>
 
+      <section className="card mt-6 p-5">
+        <h2 className="flex items-center gap-2 font-bold">
+          <AlertTriangle className="h-4 w-4 text-amber-600" /> Twilio failure
+          breakdown
+        </h2>
+        <p className="mt-1 text-xs text-slate-500">
+          Provider codes are retained verbatim. Use Twilio&apos;s current error
+          reference rather than assuming a permanent meaning in Stonegate.
+        </p>
+        {twilioFailureBreakdown.length ? (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {twilioFailureBreakdown.map((item) => (
+              <a
+                className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900"
+                href={`https://www.twilio.com/docs/api/errors/${encodeURIComponent(item.errorCode ?? "")}`}
+                key={item.errorCode}
+                rel="noreferrer"
+                target="_blank"
+              >
+                {item.errorCode}: {item._count._all.toLocaleString()}
+              </a>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-4 text-sm text-slate-500">
+            No Twilio failed or undelivered messages with an error code.
+          </p>
+        )}
+      </section>
+
       <section className="mt-6">
         <div className="mb-3 flex items-center justify-between">
           <div>
@@ -609,7 +657,27 @@ export default async function OperationsPage({
                     </td>
                     <td>
                       <StatusBadge status={message?.status ?? row.status} />
-                      {message?.sentAt ? (
+                      {message?.errorCode ? (
+                        <p className="mt-1 text-[11px] font-semibold text-rose-700">
+                          Error {message.errorCode}
+                        </p>
+                      ) : null}
+                      {message?.providerMessageId ? (
+                        <p
+                          className="mt-1 max-w-40 truncate font-mono text-[10px] text-slate-500"
+                          title={message.providerMessageId}
+                        >
+                          {message.providerMessageId}
+                        </p>
+                      ) : null}
+                      {message?.attempts[0] ? (
+                        <p className="mt-1 text-[10px] text-slate-500">
+                          Attempt {message.attempts[0].attemptNumber} ·{" "}
+                          {message.failedAt?.toLocaleString() ??
+                            message.sentAt?.toLocaleString() ??
+                            message.attempts[0].startedAt.toLocaleString()}
+                        </p>
+                      ) : message?.sentAt ? (
                         <p className="mt-1 text-[11px] text-slate-500">
                           {message.sentAt.toLocaleString()}
                         </p>

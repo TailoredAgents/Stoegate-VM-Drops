@@ -6,11 +6,14 @@ export const logger = pino({
   redact: {
     paths: [
       "req.headers.authorization",
+      "req.headers['x-twilio-signature']",
       "*.secret",
       "*.apiKey",
+      "*.authToken",
       "*.password",
       "*.token",
       "SMS_PROVIDER_WEBHOOK_SECRET",
+      "TWILIO_AUTH_TOKEN",
     ],
     censor: "[REDACTED]",
   },

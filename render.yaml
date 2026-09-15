@@ -43,6 +43,16 @@ services:
         value: "false"
       - key: SMS_PROVIDER
         value: dry-run
+      # Add these values manually in Render for diagnostics/webhook validation.
+      # sync:false never places a credential in this Blueprint.
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_MESSAGING_SERVICE_SID
+        sync: false
+      - key: TWILIO_PRODUCTION_APPROVED
+        value: "false"
       - key: DEFAULT_DAILY_SMS_LIMIT
         value: "2000"
       - key: MAX_LIVE_SMS_CAMPAIGN_LIMIT
@@ -79,6 +89,16 @@ services:
         value: "false"
       - key: SMS_PROVIDER
         value: dry-run
+      # The worker needs the same Twilio values only for a future controlled
+      # send. Keep both production gates false during setup.
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_MESSAGING_SERVICE_SID
+        sync: false
+      - key: TWILIO_PRODUCTION_APPROVED
+        value: "false"
       - key: DEFAULT_DAILY_SMS_LIMIT
         value: "2000"
       - key: MAX_LIVE_SMS_CAMPAIGN_LIMIT

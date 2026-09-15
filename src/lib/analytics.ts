@@ -113,6 +113,15 @@ export function effectiveGlobalDailySmsCap(
   return Math.min(wholeCount(configuredCap), wholeCount(environmentCap));
 }
 
+export function areSmsCostCurrenciesComparable(currencies: string[]) {
+  const normalized = new Set(
+    currencies.map((currency) => currency.trim().toUpperCase()),
+  );
+  return (
+    normalized.size === 0 || (normalized.size === 1 && normalized.has("USD"))
+  );
+}
+
 export function isQualifiedLeadOutcome(
   outcome: string | null | undefined,
 ): boolean {
@@ -409,6 +418,36 @@ export function summarizeSmsEconomics(input: SmsEconomicsInput) {
     ),
     costPerContractCents: perUnit(totalCostCents, wholeCount(input.contracts)),
     costPerClosedDealCents: perUnit(totalCostCents, wholeCount(input.closed)),
+  };
+}
+
+function omitIncomparableProviderEconomics(
+  economics: ReturnType<typeof summarizeSmsEconomics>,
+) {
+  return {
+    ...economics,
+    providerActualCostMicros: null,
+    estimatedFallbackCostMicros: null,
+    effectiveVariableCostMicros: null,
+    providerActualCostCents: null,
+    estimatedFallbackCostCents: null,
+    effectiveVariableCostCents: null,
+    variableCostCents: null,
+    totalCostCents: null,
+    allInMonthlyRunRateCents: null,
+    costPerAttemptCents: null,
+    costPerAcceptedCents: null,
+    costPerSentCents: null,
+    costPerDeliveredCents: null,
+    costPerReplyCents: null,
+    costPerInterestedCents: null,
+    costPerQualifiedLeadCents: null,
+    costPerNonresponderCents: null,
+    costPerBatchDialerEligibleCents: null,
+    costPerBatchDialerExportedCents: null,
+    costPerColdCallLeadCents: null,
+    costPerContractCents: null,
+    costPerClosedDealCents: null,
   };
 }
 
@@ -832,7 +871,9 @@ export async function getCampaignMetrics(input?: string | AnalyticsFilters) {
     inboundMessages,
     configuredOutboundMessageCostMicros:
       settings.sms_cost_per_outbound_message_micros,
-    configuredSegmentCostMicros: settings.sms_cost_per_segment_micros,
+    configuredSegmentCostMicros:
+      settings.sms_cost_per_segment_micros +
+      settings.sms_carrier_surcharge_per_outbound_segment_micros,
     configuredInboundMessageCostMicros:
       settings.sms_cost_per_inbound_message_micros,
     configuredFixedMonthlyCents,
@@ -852,6 +893,22 @@ export async function getCampaignMetrics(input?: string | AnalyticsFilters) {
     qualified,
   );
   const expectedDeals = qualified / settings.va_leads_per_deal;
+  const currency =
+    currencyGroups.length === 0
+      ? "USD"
+      : currencyGroups.length === 1
+        ? currencyGroups[0].currency
+        : "MIXED";
+  const hasMixedCurrencies = currencyGroups.length > 1;
+  // Configuration and VA benchmarks are denominated in USD. Never add or
+  // compare provider amounts in another (or multiple) currency without an
+  // explicit FX policy.
+  const costsComparable = areSmsCostCurrenciesComparable(
+    currencyGroups.map((group) => group.currency),
+  );
+  const reportableEconomics = costsComparable
+    ? economics
+    : omitIncomparableProviderEconomics(economics);
 
   return {
     date: range?.key ?? null,
@@ -905,20 +962,18 @@ export async function getCampaignMetrics(input?: string | AnalyticsFilters) {
     channelAttribution,
     outboundSegments: costAggregate._sum.segmentCount ?? 0,
     providerReportedSegments: costAggregate._sum.actualSegmentCount ?? 0,
-    currency:
-      currencyGroups.length === 0
-        ? "USD"
-        : currencyGroups.length === 1
-          ? currencyGroups[0].currency
-          : "MIXED",
-    hasMixedCurrencies: currencyGroups.length > 1,
-    ...economics,
+    currency,
+    hasMixedCurrencies,
+    costsComparable,
+    ...reportableEconomics,
     ...va,
     expectedDeals,
     costPerExpectedDealCents:
-      expectedDeals > 0 ? economics.totalCostCents / expectedDeals : null,
+      costsComparable && expectedDeals > 0
+        ? economics.totalCostCents / expectedDeals
+        : null,
     smsSavingsVsVaPerQualifiedLeadCents:
-      economics.costPerQualifiedLeadCents == null
+      !costsComparable || economics.costPerQualifiedLeadCents == null
         ? null
         : va.vaCostPerQualifiedLeadCents - economics.costPerQualifiedLeadCents,
     contactStatusCounts: Object.fromEntries(

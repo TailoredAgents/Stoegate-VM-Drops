@@ -2,8 +2,10 @@
 
 ## Status
 
-No production SMS provider has been selected, audited, or configured for
-Stonegate SMS Outreach.
+Twilio Programmable Messaging through a Messaging Service is the first selected
+production adapter. Its API and signed webhook integration are implemented, but
+Stonegate's live account, Brand, A2P Campaign, Sender Pool, and approval state
+have not been verified by this repository.
 
 The only supported checked-in configuration is:
 
@@ -12,10 +14,14 @@ SMS_LIVE_SENDS_ENABLED=false
 SMS_PROVIDER=dry-run
 ```
 
-No production credential, API endpoint, sender identity, webhook secret,
-pricing assumption, throughput claim, or activation instruction belongs in
-this document until a provider is selected and its current official contract
-has been reviewed.
+No production credential, pricing assumption, throughput claim, or approval
+claim is checked in. Twilio adds a second independent gate:
+
+```text
+TWILIO_PRODUCTION_APPROVED=false
+```
+
+See `TWILIO_SETUP.md` for the deliberately manual account and A2P steps.
 
 ## Existing provider-neutral boundary
 
@@ -25,11 +31,11 @@ The application exposes an authenticated canonical endpoint at
 `x-stonegate-signature` HMAC-SHA256 signature over the exact request body, and
 rejects events whose `providerKey` differs from `SMS_PROVIDER`.
 
-A future provider adapter must map the provider's verified delivery and inbound
-payloads into the canonical `delivery_status` or `inbound_message` contract.
+The Twilio-native form routes validate `X-Twilio-Signature` with the official
+SDK and map verified delivery and inbound payloads into the same domain model.
 The mapping must include stable provider event/message IDs, explicit timestamps,
-and the original JSON object in `rawPayload`. This endpoint does not imply that
-any provider's native signature scheme has been reviewed or implemented.
+and the original JSON object in `rawPayload`. The canonical endpoint remains
+available for provider-neutral testing; Twilio does not use its Stonegate HMAC.
 
 ## Required provider contract
 
@@ -44,8 +50,8 @@ following before implementation:
 - authenticated delivery-event webhooks with replay guidance;
 - authenticated inbound message and opt-out events;
 - E.164 destination handling and clear invalid-number errors;
-- a known, normalized originating number that can be persisted before dispatch,
-  so inbound replies can be matched to the exact outbound message;
+- a sender identity that can be persisted when assigned, so inbound replies can
+  be matched to the exact outbound message;
 - sender registration and account activation requirements;
 - account-specific throughput, queue, rate-limit, and retry behavior;
 - event timestamp format, precision, and out-of-order behavior;
@@ -110,6 +116,6 @@ and one PostgreSQL database. Their resource identifiers intentionally retain
 the old names to preserve the deployed resources during the rebrand. Those
 identifiers do not imply that an archived provider or channel is active.
 
-Both services keep `SMS_PROVIDER=dry-run` and
-`SMS_LIVE_SENDS_ENABLED=false`. Any future provider secret must be configured
-through Render's secret environment settings and must never be committed.
+Both services keep `SMS_PROVIDER=dry-run`, `SMS_LIVE_SENDS_ENABLED=false`, and
+`TWILIO_PRODUCTION_APPROVED=false`. Twilio credentials must be configured
+manually through Render's secret environment settings and never committed.

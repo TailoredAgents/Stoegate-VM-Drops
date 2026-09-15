@@ -9,7 +9,10 @@ import {
 import { db } from "@/lib/db";
 import { getEnv } from "@/lib/env";
 import { normalizeUSPhone } from "@/lib/phone";
+import { isProviderOptOutSignal } from "@/lib/provider-suppression";
 import { getAppSettings } from "@/lib/settings";
+import { lockSmsProviderReadinessSharedTx } from "@/lib/sms-dispatch-lock";
+import { assertFreshTwilioReadiness } from "@/lib/twilio-readiness";
 import {
   getBusinessSendWindowAvailability,
   getLocalDayBounds,
@@ -70,6 +73,8 @@ export interface ReserveLiveSmsAttemptInput {
   messageId: string;
   /** Defaults to the environment-selected provider and is rechecked in-transaction. */
   providerKey?: string;
+  /** Internal: the caller holds the shared readiness lock through submission. */
+  readinessLockAlreadyHeld?: boolean;
   requestPayload?: unknown;
   occurredAt?: Date;
 }
@@ -83,7 +88,10 @@ export interface ReservedLiveSmsAttempt {
   message: {
     id: string;
     toPhone: string;
-    fromPhone: string;
+    /** Assigned provider sender, if already known. Messaging Services choose it. */
+    fromPhone: string | null;
+    /** Non-secret provider sender/service reference captured on the campaign. */
+    senderReference: string;
     renderedBody: string;
     segmentCount: number;
     estimatedCostMicros: number;
@@ -130,12 +138,17 @@ export interface PersistLiveSmsProviderResultInput {
   rawResponse?: unknown;
   actualSegmentCount?: number;
   actualCostMicros?: number;
+  /** ISO 4217 unit for actual provider cost, when supplied. */
+  currency?: string;
+  /** Actual originating E.164 number selected by the provider, when known. */
+  fromPhone?: string;
   errorCode?: string;
   errorMessage?: string;
   occurredAt?: Date;
 }
 
-export type SmsDeliveryOutcome = "SENT" | "DELIVERED" | "UNDELIVERED";
+export type SmsDeliveryOutcome =
+  "ACCEPTED" | "SENT" | "DELIVERED" | "UNDELIVERED" | "FAILED";
 
 export interface PersistSmsDeliveryStatusInput {
   messageId: string;
@@ -147,6 +160,10 @@ export interface PersistSmsDeliveryStatusInput {
   rawPayload: unknown;
   actualSegmentCount?: number;
   actualCostMicros?: number;
+  /** ISO 4217 unit for actual provider cost, when supplied. */
+  currency?: string;
+  /** Actual originating E.164 number supplied by the provider callback. */
+  fromPhone?: string;
   errorCode?: string;
   errorMessage?: string;
   occurredAt?: Date;
@@ -175,6 +192,34 @@ function requiredTrimmed(value: string, field: string): string {
   const normalized = value.trim();
   if (!normalized) throw new Error(`${field} is required`);
   return normalized;
+}
+
+function optionalProviderPhone(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = normalizeUSPhone(value);
+  if (!normalized)
+    throw new Error("Provider originating number must be a valid US phone");
+  return normalized;
+}
+
+function optionalCurrency(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(normalized)) {
+    throw new Error("Provider currency must be a three-letter ISO code");
+  }
+  return normalized;
+}
+
+function requireCostCurrencyPair(
+  actualCostMicros: number | undefined,
+  currency: string | undefined,
+) {
+  if ((actualCostMicros === undefined) !== (currency === undefined)) {
+    throw new Error(
+      "Provider actual cost and currency must be supplied together",
+    );
+  }
 }
 
 function validateOptionalCount(
@@ -487,6 +532,8 @@ export async function reserveLiveSmsAttempt(
   const env = getEnv();
 
   return withSerializableRetry(async (tx) => {
+    if (!input.readinessLockAlreadyHeld)
+      await lockSmsProviderReadinessSharedTx(tx, providerKey);
     await lockReservationGraphTx(tx, input.messageId);
     const message = await tx.smsOutboundMessage.findUniqueOrThrow({
       where: { id: input.messageId },
@@ -537,9 +584,18 @@ export async function reserveLiveSmsAttempt(
     const templateVersion = message.templateVersion;
     const consent = message.consentEvidence;
     const settings = await getAppSettings(tx);
+    const twilioMessagingService = providerKey.toLowerCase() === "twilio";
 
     if (!env.SMS_LIVE_SENDS_ENABLED) {
       throw new Error("Live SMS environment guard is disabled");
+    }
+    if (
+      providerKey.toLowerCase() === "twilio" &&
+      !env.TWILIO_PRODUCTION_APPROVED
+    ) {
+      throw new Error(
+        "Twilio production approval environment guard is disabled",
+      );
     }
     if (
       providerKey.toLowerCase() === "dry-run" ||
@@ -548,6 +604,9 @@ export async function reserveLiveSmsAttempt(
       (message.providerKey && message.providerKey !== providerKey)
     ) {
       throw new Error("SMS provider does not match the approved live provider");
+    }
+    if (twilioMessagingService) {
+      await assertFreshTwilioReadiness({ client: tx, env, now: occurredAt });
     }
     if (
       campaign.kind !== "SMS" ||
@@ -633,18 +692,40 @@ export async function reserveLiveSmsAttempt(
         "Destination is not the contact's normalized US E.164 number",
       );
     }
-    const originatingPhone = message.fromPhone ?? campaign.smsSenderRef;
-    if (
+    const senderReference = campaign.smsSenderRef;
+    const originatingPhone = twilioMessagingService
+      ? message.fromPhone
+      : (message.fromPhone ?? senderReference);
+    if (twilioMessagingService) {
+      if (
+        !env.TWILIO_MESSAGING_SERVICE_SID ||
+        senderReference !== env.TWILIO_MESSAGING_SERVICE_SID ||
+        !/^MG[0-9a-f]{32}$/i.test(senderReference)
+      ) {
+        throw new Error(
+          "Campaign Messaging Service does not match the approved Twilio configuration",
+        );
+      }
+      if (
+        originatingPhone !== null &&
+        normalizeUSPhone(originatingPhone) !== originatingPhone
+      ) {
+        throw new Error("The provider-assigned Twilio sender is invalid");
+      }
+    } else if (
+      !senderReference ||
       !originatingPhone ||
       normalizeUSPhone(originatingPhone) !== originatingPhone ||
-      (message.fromPhone !== null &&
-        campaign.smsSenderRef !== null &&
-        message.fromPhone !== campaign.smsSenderRef)
+      (message.fromPhone !== null && message.fromPhone !== senderReference)
     ) {
       throw new Error(
         "A single normalized originating SMS phone number must be configured",
       );
     }
+    const validatedSenderReference = requiredTrimmed(
+      senderReference ?? "",
+      "campaign sender reference",
+    );
     if (
       !consent ||
       consent.contactId !== contact.id ||
@@ -816,7 +897,9 @@ export async function reserveLiveSmsAttempt(
           toInputJson(
             {
               to: message.toPhone,
-              from: originatingPhone,
+              ...(twilioMessagingService
+                ? { messagingServiceSid: validatedSenderReference }
+                : { from: originatingPhone }),
               bodyHash: message.bodyHash,
               segmentCount: message.segmentCount,
             },
@@ -854,7 +937,7 @@ export async function reserveLiveSmsAttempt(
       where: { id: message.id, status: { in: [...RESERVABLE_MESSAGE_STATES] } },
       data: {
         providerKey,
-        fromPhone: originatingPhone,
+        fromPhone: originatingPhone ?? undefined,
         status: "SUBMITTING",
         submissionStartedAt: occurredAt,
         suppressionCheckedAt: occurredAt,
@@ -915,6 +998,7 @@ export async function reserveLiveSmsAttempt(
       },
       metadata: {
         providerKey,
+        senderReference: validatedSenderReference,
         attemptNumber,
         campaignTotalUsed: campaignTotalUsed + 1,
         campaignDailyUsed: campaignDailyUsed + 1,
@@ -936,6 +1020,7 @@ export async function reserveLiveSmsAttempt(
         id: message.id,
         toPhone: message.toPhone,
         fromPhone: originatingPhone,
+        senderReference: validatedSenderReference,
         renderedBody: message.renderedBody,
         segmentCount: message.segmentCount,
         estimatedCostMicros: message.estimatedCostMicros,
@@ -967,6 +1052,9 @@ export async function persistLiveSmsProviderResult(
   );
   validateOptionalCount(input.actualSegmentCount, "actualSegmentCount", 1);
   validateOptionalCount(input.actualCostMicros, "actualCostMicros", 0);
+  const providerFromPhone = optionalProviderPhone(input.fromPhone);
+  const providerCurrency = optionalCurrency(input.currency);
+  requireCostCurrencyPair(input.actualCostMicros, providerCurrency);
   if (input.outcome === "ACCEPTED" && !input.providerMessageId?.trim()) {
     throw new Error("providerMessageId is required for an accepted SMS");
   }
@@ -992,6 +1080,13 @@ export async function persistLiveSmsProviderResult(
     );
     const campaign = message.campaignContact.campaign;
     const sequence = message.sequence;
+    if (
+      providerFromPhone &&
+      message.fromPhone &&
+      message.fromPhone !== providerFromPhone
+    ) {
+      throw new Error("Provider sender conflicts with the outbound SMS record");
+    }
     if (
       attempt.messageId !== message.id ||
       attempt.attemptNumber !== 1 ||
@@ -1053,8 +1148,10 @@ export async function persistLiveSmsProviderResult(
         status: targetMessageStatus,
         providerMessageId: input.providerMessageId?.trim() || null,
         providerStatus: input.providerStatus?.trim() || input.outcome,
+        fromPhone: providerFromPhone,
         actualSegmentCount: input.actualSegmentCount,
         actualCostMicros: input.actualCostMicros,
+        ...(providerCurrency ? { currency: providerCurrency } : {}),
         acceptedAt: input.outcome === "ACCEPTED" ? occurredAt : undefined,
         failedAt: input.outcome === "REJECTED" ? occurredAt : undefined,
         errorCode,
@@ -1155,6 +1252,8 @@ export async function persistLiveSmsProviderResult(
         providerStatus: input.providerStatus ?? input.outcome,
         actualSegmentCount: input.actualSegmentCount ?? null,
         actualCostMicros: input.actualCostMicros ?? null,
+        currency: providerCurrency ?? message.currency,
+        fromPhone: providerFromPhone ?? message.fromPhone,
       },
       rawPayload: rawResponse,
     });
@@ -1187,6 +1286,13 @@ export async function persistSmsDeliveryStatus(
   const rawPayload = toInputJson(input.rawPayload, "rawPayload");
   validateOptionalCount(input.actualSegmentCount, "actualSegmentCount", 1);
   validateOptionalCount(input.actualCostMicros, "actualCostMicros", 0);
+  const providerFromPhone = optionalProviderPhone(input.fromPhone);
+  const providerCurrency = optionalCurrency(input.currency);
+  requireCostCurrencyPair(input.actualCostMicros, providerCurrency);
+  const providerOptOutPending = isProviderOptOutSignal(
+    providerKey,
+    input.errorCode,
+  );
 
   return withSerializableRetry(async (tx) => {
     await lockMessageGraphTx(tx, input.messageId);
@@ -1258,8 +1364,10 @@ export async function persistSmsDeliveryStatus(
           providerStatus,
           rawPayload,
           occurredAt,
-          processedAt: receivedAt,
+          processedAt: providerOptOutPending ? null : receivedAt,
           processingError: null,
+          errorCode: input.errorCode?.trim() || null,
+          errorMessage: input.errorMessage?.trim() || null,
         },
       });
     else
@@ -1274,13 +1382,23 @@ export async function persistSmsDeliveryStatus(
           rawPayload,
           occurredAt,
           receivedAt,
-          processedAt: receivedAt,
+          processedAt: providerOptOutPending ? null : receivedAt,
+          errorCode: input.errorCode?.trim() || null,
+          errorMessage: input.errorMessage?.trim() || null,
         },
       });
 
     const current = message.status;
+    if (
+      providerFromPhone &&
+      message.fromPhone &&
+      message.fromPhone !== providerFromPhone
+    ) {
+      throw new Error("Provider sender conflicts with the outbound SMS record");
+    }
     const terminal = [
       "FAILED",
+      "DELIVERED",
       "UNDELIVERED",
       "SUPPRESSED",
       "CANCELED",
@@ -1288,8 +1406,10 @@ export async function persistSmsDeliveryStatus(
     ].includes(current);
     const mayApply =
       !terminal &&
-      ((input.outcome === "SENT" &&
-        ["SUBMITTING", "ACCEPTED"].includes(current)) ||
+      ((input.outcome === "ACCEPTED" &&
+        ["SUBMITTING", "SUBMISSION_UNKNOWN"].includes(current)) ||
+        (input.outcome === "SENT" &&
+          ["SUBMITTING", "SUBMISSION_UNKNOWN", "ACCEPTED"].includes(current)) ||
         (input.outcome === "DELIVERED" &&
           ["SUBMITTING", "SUBMISSION_UNKNOWN", "ACCEPTED", "SENT"].includes(
             current,
@@ -1297,8 +1417,18 @@ export async function persistSmsDeliveryStatus(
         (input.outcome === "UNDELIVERED" &&
           ["SUBMITTING", "SUBMISSION_UNKNOWN", "ACCEPTED", "SENT"].includes(
             current,
+          )) ||
+        (input.outcome === "FAILED" &&
+          ["SUBMITTING", "SUBMISSION_UNKNOWN", "ACCEPTED", "SENT"].includes(
+            current,
           )));
     if (!mayApply) {
+      if (providerFromPhone && !message.fromPhone) {
+        await tx.smsOutboundMessage.update({
+          where: { id: message.id },
+          data: { fromPhone: providerFromPhone },
+        });
+      }
       await createStatusAuditTx(tx, {
         messageId: message.id,
         campaignId: message.campaignContact.campaign.id,
@@ -1327,11 +1457,12 @@ export async function persistSmsDeliveryStatus(
 
     const campaign = message.campaignContact.campaign;
     const sequence = message.sequence;
-    const isUndelivered = input.outcome === "UNDELIVERED";
-    const errorCode = isUndelivered
-      ? (input.errorCode ?? "SMS_UNDELIVERED")
+    const isFailure = ["UNDELIVERED", "FAILED"].includes(input.outcome);
+    const errorCode = isFailure
+      ? (input.errorCode ??
+        (input.outcome === "FAILED" ? "SMS_FAILED" : "SMS_UNDELIVERED"))
       : null;
-    const errorMessage = isUndelivered ? (input.errorMessage ?? null) : null;
+    const errorMessage = isFailure ? (input.errorMessage ?? null) : null;
     const confirmsSend =
       input.outcome === "SENT" || input.outcome === "DELIVERED";
     const sentAt = confirmsSend
@@ -1368,12 +1499,14 @@ export async function persistSmsDeliveryStatus(
         status: input.outcome,
         providerMessageId,
         providerStatus,
+        fromPhone: providerFromPhone,
         actualSegmentCount: input.actualSegmentCount,
         actualCostMicros: input.actualCostMicros,
+        ...(providerCurrency ? { currency: providerCurrency } : {}),
         acceptedAt,
         sentAt: confirmsSend ? sentAt : undefined,
         deliveredAt: input.outcome === "DELIVERED" ? occurredAt : undefined,
-        failedAt: isUndelivered ? occurredAt : undefined,
+        failedAt: isFailure ? occurredAt : undefined,
         errorCode,
         errorMessage,
       },
@@ -1388,9 +1521,10 @@ export async function persistSmsDeliveryStatus(
     });
     await tx.outreachSequence.update({
       where: { id: sequence.id },
-      data: isUndelivered
+      data: isFailure
         ? {
-            currentState: "SMS_UNDELIVERED",
+            currentState:
+              input.outcome === "FAILED" ? "SMS_FAILED" : "SMS_UNDELIVERED",
             version: { increment: 1 },
             coldCallDueAt: null,
             nextEligibleAt: null,
@@ -1398,18 +1532,29 @@ export async function persistSmsDeliveryStatus(
             terminalReason: errorCode,
             lastEventAt: occurredAt,
           }
-        : {
-            currentState:
-              input.outcome === "DELIVERED" ? "SMS_DELIVERED" : "SMS_SENT",
-            version: { increment: 1 },
-            smsSentAt: coldCallAnchor,
-            smsToColdCallDelayHours: campaign.smsColdCallDelayHours,
-            coldCallDueAt: effectiveColdCallDueAt,
-            nextEligibleAt: effectiveColdCallDueAt,
-            terminalAt: null,
-            terminalReason: null,
-            lastEventAt: occurredAt,
-          },
+        : input.outcome === "ACCEPTED"
+          ? {
+              currentState: "SMS_ACCEPTED",
+              version: { increment: 1 },
+              smsSentAt: null,
+              coldCallDueAt: null,
+              nextEligibleAt: null,
+              terminalAt: null,
+              terminalReason: null,
+              lastEventAt: occurredAt,
+            }
+          : {
+              currentState:
+                input.outcome === "DELIVERED" ? "SMS_DELIVERED" : "SMS_SENT",
+              version: { increment: 1 },
+              smsSentAt: coldCallAnchor,
+              smsToColdCallDelayHours: campaign.smsColdCallDelayHours,
+              coldCallDueAt: effectiveColdCallDueAt,
+              nextEligibleAt: effectiveColdCallDueAt,
+              terminalAt: null,
+              terminalReason: null,
+              lastEventAt: occurredAt,
+            },
     });
 
     const settings = await getAppSettings(tx);
@@ -1439,7 +1584,11 @@ export async function persistSmsDeliveryStatus(
         ? ("SMS_DELIVERED" as const)
         : input.outcome === "UNDELIVERED"
           ? ("SMS_UNDELIVERED" as const)
-          : ("SMS_SENT" as const);
+          : input.outcome === "FAILED"
+            ? ("SMS_FAILED" as const)
+            : input.outcome === "ACCEPTED"
+              ? ("SMS_ACCEPTED" as const)
+              : ("SMS_SENT" as const);
     await createTransitionRecordsTx(tx, {
       messageId: message.id,
       sequenceId: sequence.id,
@@ -1450,7 +1599,11 @@ export async function persistSmsDeliveryStatus(
           ? "SMS_DELIVERED"
           : input.outcome === "UNDELIVERED"
             ? "SMS_UNDELIVERED"
-            : "SMS_SENT",
+            : input.outcome === "FAILED"
+              ? "SMS_FAILED"
+              : input.outcome === "ACCEPTED"
+                ? "SMS_ACCEPTED"
+                : "SMS_SENT",
       resultingState,
       source: "sms-provider-status",
       idempotencySuffix: `status:${providerKey}:${providerEventId}`,
@@ -1471,6 +1624,10 @@ export async function persistSmsDeliveryStatus(
         providerStatus,
         actualSegmentCount: input.actualSegmentCount ?? null,
         actualCostMicros: input.actualCostMicros ?? null,
+        currency: providerCurrency ?? message.currency,
+        fromPhone: providerFromPhone ?? message.fromPhone,
+        errorCode,
+        errorMessage,
       },
       rawPayload,
     });

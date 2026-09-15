@@ -162,21 +162,30 @@ export function selectMostRecentReplyCandidate<
   candidates: readonly T[],
   inbound: { providerKey: string; fromPhone: string; toPhone: string },
 ): T | null {
-  return (
-    candidates
-      .filter(
-        (candidate) =>
-          candidate.providerKey === inbound.providerKey &&
-          candidate.toPhone === inbound.fromPhone &&
-          candidate.fromPhone === inbound.toPhone &&
-          replyMatchStatuses.includes(candidate.status),
-      )
-      .toSorted(
-        (left, right) =>
-          (right.sentAt ?? right.acceptedAt ?? right.createdAt).getTime() -
-          (left.sentAt ?? left.acceptedAt ?? left.createdAt).getTime(),
-      )[0] ?? null
-  );
+  const matches = candidates
+    .filter(
+      (candidate) =>
+        candidate.providerKey === inbound.providerKey &&
+        candidate.toPhone === inbound.fromPhone &&
+        candidate.fromPhone === inbound.toPhone &&
+        replyMatchStatuses.includes(candidate.status),
+    )
+    .toSorted(
+      (left, right) =>
+        (right.sentAt ?? right.acceptedAt ?? right.createdAt).getTime() -
+        (left.sentAt ?? left.acceptedAt ?? left.createdAt).getTime(),
+    );
+  const newest = matches[0];
+  const runnerUp = matches[1];
+  if (!newest) return null;
+  if (
+    runnerUp &&
+    (newest.sentAt ?? newest.acceptedAt ?? newest.createdAt).getTime() ===
+      (runnerUp.sentAt ?? runnerUp.acceptedAt ?? runnerUp.createdAt).getTime()
+  ) {
+    return null;
+  }
+  return newest;
 }
 
 export interface RecordSmsInboundInput {
@@ -239,6 +248,10 @@ function normalizedInbound(input: RecordSmsInboundInput) {
     body,
     receivedAt: input.receivedAt,
     isOptOut,
+    optOutSource:
+      providerKey === "twilio"
+        ? "TWILIO_INBOUND_OPT_OUT"
+        : "sms_inbound_opt_out",
     rawPayload: inputJson(input.rawPayload),
   };
 }
@@ -421,15 +434,19 @@ async function markCampaignReplyTx(
     normalizedPhone: string;
     occurredAt: Date;
     idempotencyBase: string;
+    source?: string;
+    terminalReason?: string;
   },
 ) {
+  const source = input.source ?? "sms_inbound_reply";
+  const terminalReason = input.terminalReason ?? "SMS_REPLIED";
   await lockSmsPhoneDispatchTx(tx, input.normalizedPhone);
   await upsertCampaignSuppressionTx(tx, {
     campaignId: input.campaignId,
     contactId: input.contactId,
     normalizedPhone: input.normalizedPhone,
     reason: "COMPLIANCE",
-    source: "sms_inbound_reply",
+    source,
   });
   await tx.smsOutboundMessage.updateMany({
     where: {
@@ -459,13 +476,13 @@ async function markCampaignReplyTx(
     type: resultingState === "SMS_REPLIED" ? "SMS_REPLIED" : "OUTCOME_RECORDED",
     resultingState,
     idempotencyKey: `${input.idempotencyBase}:sequence:${sequence.id}`,
-    source: "sms_inbound_reply",
+    source,
     occurredAt: input.occurredAt,
     outcome: "INBOUND_REPLY",
     projection: {
       smsRespondedAt: sequence.smsRespondedAt ?? input.occurredAt,
       terminalAt: sequence.terminalAt ?? input.occurredAt,
-      terminalReason: sequence.terminalReason ?? "SMS_REPLIED",
+      terminalReason: sequence.terminalReason ?? terminalReason,
       coldCallDueAt: null,
       coldCallEligibleAt: null,
       nextEligibleAt: null,
@@ -500,6 +517,36 @@ async function recordSmsInboundOnce(
       });
       if (existing) {
         assertDuplicateMatches(existing, input);
+        if (
+          input.isOptOut &&
+          !existing.isOptOut &&
+          existing.classification !== "OPT_OUT"
+        ) {
+          await globallySuppressPhoneTx(tx, {
+            normalizedPhone: input.fromPhone,
+            reason: "OPT_OUT",
+            source: input.optOutSource,
+            occurredAt: input.receivedAt,
+            idempotencyBase: `sms-inbound:${identity}:provider-opt-out-promotion`,
+          });
+          await tx.smsInboundMessage.update({
+            where: { id: existing.id },
+            data: {
+              classification: "OPT_OUT",
+              classificationSource: "PROVIDER_OR_KEYWORD",
+              classificationConfidence: 1,
+              classifiedAt: input.receivedAt,
+              isOptOut: true,
+            },
+          });
+          return {
+            messageId: existing.id,
+            conversationId: existing.conversationId,
+            matchedOutboundMessageId: existing.inReplyToMessageId,
+            duplicate: true,
+            classification: "OPT_OUT",
+          };
+        }
         return {
           messageId: existing.id,
           conversationId: existing.conversationId,
@@ -509,12 +556,42 @@ async function recordSmsInboundOnce(
         };
       }
 
-      const matchIds = await tx.$queryRaw<Array<{ id: string }>>`
-        SELECT "id"
+      const matchIds = await tx.$queryRaw<
+        Array<{ id: string; contextAt: Date }>
+      >`
+        WITH candidates AS (
+          SELECT "id",
+            COALESCE("sentAt", "acceptedAt", "createdAt") AS "contextAt"
+          FROM "SmsOutboundMessage"
+          WHERE "providerKey" = ${input.providerKey}
+            AND "toPhone" = ${input.fromPhone}
+            AND "fromPhone" = ${input.toPhone}
+            AND "status" IN (
+              'SUBMISSION_UNKNOWN'::"SmsMessageStatus",
+              'ACCEPTED'::"SmsMessageStatus",
+              'SENT'::"SmsMessageStatus",
+              'DELIVERED'::"SmsMessageStatus",
+              'REPLIED'::"SmsMessageStatus"
+            )
+        )
+        SELECT "id", "contextAt"
+        FROM candidates
+        WHERE "contextAt" = (SELECT MAX("contextAt") FROM candidates)
+        ORDER BY "id" ASC
+      `;
+      // Twilio chooses a Messaging Service sender during submission. A reply
+      // can beat the response/status callback that persists that E.164 From.
+      // Compare null-sender rows even when an older exact-sender row exists;
+      // otherwise a reply can be attributed to the old campaign while the new
+      // campaign continues toward cold calling.
+      const nullSenderCandidates = await tx.$queryRaw<
+        Array<{ id: string; contextAt: Date }>
+      >`
+        SELECT "id", COALESCE("sentAt", "acceptedAt", "createdAt") AS "contextAt"
         FROM "SmsOutboundMessage"
         WHERE "providerKey" = ${input.providerKey}
           AND "toPhone" = ${input.fromPhone}
-          AND "fromPhone" = ${input.toPhone}
+          AND "fromPhone" IS NULL
           AND "status" IN (
             'SUBMISSION_UNKNOWN'::"SmsMessageStatus",
             'ACCEPTED'::"SmsMessageStatus",
@@ -522,25 +599,37 @@ async function recordSmsInboundOnce(
             'DELIVERED'::"SmsMessageStatus",
             'REPLIED'::"SmsMessageStatus"
           )
-        ORDER BY COALESCE("sentAt", "acceptedAt", "createdAt") DESC,
-          "createdAt" DESC
-        LIMIT 1
+        ORDER BY "id" ASC
       `;
-      const matched = matchIds[0]
-        ? await tx.smsOutboundMessage.findUnique({
-            where: { id: matchIds[0].id },
-            include: {
-              campaignContact: {
-                include: {
-                  contact: true,
-                  outreachSequence: true,
-                  smsConversation: true,
+      const exactContextAt = matchIds[0]?.contextAt.getTime();
+      const unresolvedSenderMatchIds = nullSenderCandidates.filter(
+        (candidate) =>
+          exactContextAt === undefined ||
+          candidate.contextAt.getTime() >= exactContextAt,
+      );
+      const unresolvedSenderMatch = unresolvedSenderMatchIds.length > 0;
+      const ambiguousMatch =
+        matchIds.length > 1 || (matchIds.length > 0 && unresolvedSenderMatch);
+      const reviewMatchIds = [
+        ...(ambiguousMatch ? matchIds.map((candidate) => candidate.id) : []),
+        ...unresolvedSenderMatchIds.map((candidate) => candidate.id),
+      ];
+      const matched =
+        matchIds[0] && !ambiguousMatch && !unresolvedSenderMatch
+          ? await tx.smsOutboundMessage.findUnique({
+              where: { id: matchIds[0].id },
+              include: {
+                campaignContact: {
+                  include: {
+                    contact: true,
+                    outreachSequence: true,
+                    smsConversation: true,
+                  },
                 },
+                conversation: true,
               },
-              conversation: true,
-            },
-          })
-        : null;
+            })
+          : null;
       const fallbackContact = matched
         ? matched.campaignContact.contact
         : await tx.contact.findUnique({
@@ -626,7 +715,9 @@ async function recordSmsInboundOnce(
 
       const classification: SmsInboundClassification = input.isOptOut
         ? "OPT_OUT"
-        : "UNCLASSIFIED";
+        : ambiguousMatch || unresolvedSenderMatch
+          ? "NEEDS_REVIEW"
+          : "UNCLASSIFIED";
       const inbound = await tx.smsInboundMessage.create({
         data: {
           conversationId: conversation?.id,
@@ -662,7 +753,7 @@ async function recordSmsInboundOnce(
           await globallySuppressPhoneTx(tx, {
             normalizedPhone: input.fromPhone,
             reason: "OPT_OUT",
-            source: "sms_inbound_opt_out",
+            source: input.optOutSource,
             occurredAt: input.receivedAt,
             idempotencyBase: `sms-inbound:${identity}`,
             targetSequenceId: sequence?.id,
@@ -680,10 +771,43 @@ async function recordSmsInboundOnce(
         await globallySuppressPhoneTx(tx, {
           normalizedPhone: input.fromPhone,
           reason: "OPT_OUT",
-          source: "sms_inbound_opt_out",
+          source: input.optOutSource,
           occurredAt: input.receivedAt,
           idempotencyBase: `sms-inbound:${identity}`,
         });
+      } else if (reviewMatchIds.length) {
+        // Preserve attribution as null, but place every plausible candidate
+        // campaign on a safety hold so none can reach BatchDialer.
+        const candidateContacts = await tx.campaignContact.findMany({
+          where: {
+            outboundMessages: {
+              some: { id: { in: reviewMatchIds } },
+            },
+          },
+          select: {
+            id: true,
+            campaignId: true,
+            contactId: true,
+            outreachSequence: { select: { id: true } },
+          },
+          orderBy: { id: "asc" },
+        });
+        for (const candidate of candidateContacts) {
+          await markCampaignReplyTx(tx, {
+            campaignId: candidate.campaignId,
+            contactId: candidate.contactId,
+            sequenceId: candidate.outreachSequence?.id,
+            normalizedPhone: input.fromPhone,
+            occurredAt: input.receivedAt,
+            idempotencyBase: `sms-inbound:${identity}:review:${candidate.id}`,
+            source: ambiguousMatch
+              ? "sms_inbound_ambiguous_reply_hold"
+              : "sms_inbound_unresolved_sender_reply_hold",
+            terminalReason: ambiguousMatch
+              ? "AMBIGUOUS_SMS_REPLY_REVIEW"
+              : "UNRESOLVED_SENDER_SMS_REPLY_REVIEW",
+          });
+        }
       }
 
       await tx.smsAuditEvent.create({
@@ -700,6 +824,10 @@ async function recordSmsInboundOnce(
             providerMessageId: input.providerMessageId,
             classification,
             matchedOutboundMessageId: matched?.id ?? null,
+            ambiguousMatch,
+            ambiguousCandidateCount: ambiguousMatch ? matchIds.length : 0,
+            unresolvedSenderMatch,
+            unresolvedSenderCandidateCount: unresolvedSenderMatchIds.length,
           },
           occurredAt: input.receivedAt,
         },

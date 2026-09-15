@@ -2,8 +2,15 @@ import { Prisma } from "@prisma/client";
 import { z } from "zod";
 
 import { db } from "@/lib/db";
+import { normalizeUSPhone } from "@/lib/phone";
+import { isProviderOptOutSignal } from "@/lib/provider-suppression";
+import { withSmsPhoneDispatchLock } from "@/lib/sms-dispatch-lock";
 import { persistSmsDeliveryStatus } from "@/lib/sms-operations";
 import { recordSmsInboundMessage } from "@/lib/sms-conversations";
+import {
+  suppressPhoneGlobally,
+  suppressPhoneGloballyWhileDispatchLocked,
+} from "@/lib/suppression";
 
 const providerKey = z.string().trim().min(1).max(100);
 const providerIdentifier = z.string().trim().min(1).max(300);
@@ -56,6 +63,61 @@ export const canonicalSmsWebhookSchema = z.discriminatedUnion("type", [
 
 export type CanonicalSmsWebhook = z.infer<typeof canonicalSmsWebhookSchema>;
 
+async function reconcileProviderOptOutSignal(
+  event: {
+    providerKey: string;
+    providerEventId: string;
+    errorCode: string | null;
+    rawPayload: unknown;
+    occurredAt: Date | null;
+    receivedAt: Date;
+  },
+  storedRecipient: string,
+  phoneDispatchLockAlreadyHeld = false,
+) {
+  if (!isProviderOptOutSignal(event.providerKey, event.errorCode)) return false;
+  const rawRecord =
+    event.rawPayload &&
+    typeof event.rawPayload === "object" &&
+    !Array.isArray(event.rawPayload)
+      ? (event.rawPayload as Record<string, unknown>)
+      : null;
+  const rawTo = typeof rawRecord?.To === "string" ? rawRecord.To : undefined;
+  const normalizedPhone = normalizeUSPhone(storedRecipient);
+  if (!normalizedPhone) return true;
+  if (rawTo) {
+    const callbackRecipient = normalizeUSPhone(rawTo);
+    if (!callbackRecipient || callbackRecipient !== normalizedPhone)
+      return true;
+  }
+  const suppress = phoneDispatchLockAlreadyHeld
+    ? suppressPhoneGloballyWhileDispatchLocked
+    : suppressPhoneGlobally;
+  await suppress({
+    normalizedPhone,
+    reason: "PROVIDER_DNC",
+    source: "twilio_provider_opt_out",
+    notes: "Twilio reported that the recipient opted out of messaging.",
+    occurredAt: event.occurredAt ?? event.receivedAt,
+    idempotencyKey: `twilio-provider-opt-out:${event.providerEventId}`,
+  });
+  return true;
+}
+
+async function markProviderOptOutProcessed(
+  event: { providerKey: string; providerEventId: string },
+  messageId: string,
+) {
+  await db.smsStatusEvent.updateMany({
+    where: {
+      providerKey: event.providerKey,
+      providerEventId: event.providerEventId,
+      messageId,
+    },
+    data: { processedAt: new Date(), processingError: null },
+  });
+}
+
 export function parseCanonicalSmsWebhook(rawBody: string): CanonicalSmsWebhook {
   return canonicalSmsWebhookSchema.parse(JSON.parse(rawBody));
 }
@@ -97,7 +159,7 @@ export async function processCanonicalSmsWebhook(
           providerKey: event.providerKey,
           providerMessageId: event.providerMessageId,
         },
-    select: { id: true },
+    select: { id: true, toPhone: true },
   });
   if (!message) {
     const existing = await db.smsStatusEvent.findUnique({
@@ -121,11 +183,15 @@ export async function processCanonicalSmsWebhook(
               ? "DELIVERED"
               : event.status === "sent"
                 ? "SENT"
-                : "UNDELIVERED",
+                : event.status === "undelivered"
+                  ? "UNDELIVERED"
+                  : "FAILED",
           rawPayload,
           occurredAt: new Date(event.occurredAt),
           processedAt: new Date(),
           processingError: "No outbound SMS matched this provider message ID",
+          errorCode: event.failureCode ?? null,
+          errorMessage: event.failureReason ?? null,
         },
       });
     return {
@@ -135,32 +201,66 @@ export async function processCanonicalSmsWebhook(
     };
   }
 
-  const result = await persistSmsDeliveryStatus({
-    messageId: message.id,
-    providerKey: event.providerKey,
-    providerEventId: event.providerEventId,
-    providerMessageId: event.providerMessageId,
-    providerStatus: event.status,
-    outcome:
-      event.status === "delivered"
-        ? "DELIVERED"
-        : event.status === "sent"
-          ? "SENT"
-          : "UNDELIVERED",
-    rawPayload,
-    actualSegmentCount: event.segments,
-    actualCostMicros: event.costMicros,
-    errorCode: event.failureCode,
-    errorMessage: event.failureReason,
-    occurredAt: new Date(event.occurredAt),
-  });
-  return {
-    kind: "delivery_status",
-    matched: true,
-    duplicate: result.reason === "already_recorded",
-    status: result.messageStatus,
-    applied: result.updated,
+  const persistMatchedStatus = async (
+    phoneDispatchLockAlreadyHeld: boolean,
+  ) => {
+    const result = await persistSmsDeliveryStatus({
+      messageId: message.id,
+      providerKey: event.providerKey,
+      providerEventId: event.providerEventId,
+      providerMessageId: event.providerMessageId,
+      providerStatus: event.status,
+      outcome:
+        event.status === "delivered"
+          ? "DELIVERED"
+          : event.status === "sent"
+            ? "SENT"
+            : event.status === "undelivered"
+              ? "UNDELIVERED"
+              : "FAILED",
+      rawPayload,
+      actualSegmentCount: event.segments,
+      actualCostMicros: event.costMicros,
+      currency: event.currency,
+      errorCode: event.failureCode,
+      errorMessage: event.failureReason,
+      occurredAt: new Date(event.occurredAt),
+    });
+    if (
+      await reconcileProviderOptOutSignal(
+        {
+          providerKey: event.providerKey,
+          providerEventId: event.providerEventId,
+          errorCode: event.failureCode ?? null,
+          rawPayload,
+          occurredAt: new Date(event.occurredAt),
+          receivedAt: new Date(),
+        },
+        message.toPhone,
+        phoneDispatchLockAlreadyHeld,
+      )
+    ) {
+      await markProviderOptOutProcessed(event, message.id);
+    }
+    return {
+      kind: "delivery_status",
+      matched: true,
+      duplicate: result.reason === "already_recorded",
+      status: result.messageStatus,
+      applied: result.updated,
+    };
   };
+
+  const normalizedPhone = normalizeUSPhone(message.toPhone);
+  if (
+    normalizedPhone &&
+    isProviderOptOutSignal(event.providerKey, event.failureCode)
+  ) {
+    return withSmsPhoneDispatchLock(normalizedPhone, () =>
+      persistMatchedStatus(true),
+    );
+  }
+  return persistMatchedStatus(false);
 }
 
 /**
@@ -168,14 +268,63 @@ export async function processCanonicalSmsWebhook(
  * events remain in PostgreSQL until a matching provider message ID exists.
  */
 export async function reconcileUnmatchedSmsStatusEvents(limit = 100) {
+  const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+  const candidateIds = await db.$queryRaw<Array<{ id: string }>>`
+    SELECT event."id"
+    FROM "SmsStatusEvent" AS event
+    WHERE event."providerMessageId" IS NOT NULL
+      AND (
+        (
+          event."messageId" IS NULL
+          AND (
+            event."status" IN ('ACCEPTED', 'SENT', 'DELIVERED', 'UNDELIVERED', 'FAILED')
+            OR (event."providerKey" = 'twilio' AND event."status" IS NULL)
+          )
+        )
+        OR (
+          event."messageId" IS NOT NULL
+          AND event."providerKey" = 'twilio'
+          AND event."errorCode" = '21610'
+          AND event."processedAt" IS NULL
+        )
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM "SmsOutboundMessage" AS message
+        WHERE message."providerKey" = event."providerKey"
+          AND message."providerMessageId" = event."providerMessageId"
+          AND (event."messageId" IS NULL OR event."messageId" = message."id")
+      )
+    ORDER BY event."receivedAt" ASC, event."id" ASC
+    LIMIT ${boundedLimit}
+  `;
+  if (!candidateIds.length) return { examined: 0, matched: 0 };
+
   const events = await db.smsStatusEvent.findMany({
     where: {
-      messageId: null,
+      id: { in: candidateIds.map((event) => event.id) },
       providerMessageId: { not: null },
-      status: { in: ["SENT", "DELIVERED", "UNDELIVERED"] },
+      OR: [
+        {
+          messageId: null,
+          OR: [
+            {
+              status: {
+                in: ["ACCEPTED", "SENT", "DELIVERED", "UNDELIVERED", "FAILED"],
+              },
+            },
+            { providerKey: "twilio", status: null },
+          ],
+        },
+        {
+          messageId: { not: null },
+          providerKey: "twilio",
+          errorCode: "21610",
+          processedAt: null,
+        },
+      ],
     },
-    orderBy: { receivedAt: "asc" },
-    take: Math.max(1, Math.min(500, Math.trunc(limit))),
+    orderBy: [{ receivedAt: "asc" }, { id: "asc" }],
   });
   let matched = 0;
   for (const event of events) {
@@ -184,22 +333,86 @@ export async function reconcileUnmatchedSmsStatusEvents(limit = 100) {
         providerKey: event.providerKey,
         providerMessageId: event.providerMessageId!,
       },
-      select: { id: true },
+      select: { id: true, toPhone: true },
     });
-    if (!message) continue;
+    if (!message || (event.messageId && event.messageId !== message.id))
+      continue;
     try {
-      await persistSmsDeliveryStatus({
-        messageId: message.id,
-        providerKey: event.providerKey,
-        providerEventId: event.providerEventId,
-        providerMessageId: event.providerMessageId!,
-        providerStatus: event.providerStatus,
-        outcome: event.status as "SENT" | "DELIVERED" | "UNDELIVERED",
-        rawPayload: event.rawPayload,
-        occurredAt: event.occurredAt ?? event.receivedAt,
-        receivedAt: event.receivedAt,
-      });
-      matched += 1;
+      const reconcileEvent = async (phoneDispatchLockAlreadyHeld: boolean) => {
+        if (event.status === null) {
+          let attachedCount = 0;
+          if (!event.messageId) {
+            const attached = await db.smsStatusEvent.updateMany({
+              where: { id: event.id, messageId: null, status: null },
+              data: {
+                messageId: message.id,
+                processedAt: isProviderOptOutSignal(
+                  event.providerKey,
+                  event.errorCode,
+                )
+                  ? null
+                  : new Date(),
+                processingError: null,
+              },
+            });
+            attachedCount = attached.count;
+          }
+          if (
+            await reconcileProviderOptOutSignal(
+              event,
+              message.toPhone,
+              phoneDispatchLockAlreadyHeld,
+            )
+          ) {
+            await markProviderOptOutProcessed(event, message.id);
+          }
+          matched += event.messageId ? 1 : attachedCount;
+          return;
+        }
+        await persistSmsDeliveryStatus({
+          messageId: message.id,
+          providerKey: event.providerKey,
+          providerEventId: event.providerEventId,
+          providerMessageId: event.providerMessageId!,
+          providerStatus: event.providerStatus,
+          outcome: event.status as
+            "ACCEPTED" | "SENT" | "DELIVERED" | "UNDELIVERED" | "FAILED",
+          rawPayload: event.rawPayload,
+          fromPhone:
+            event.rawPayload &&
+            typeof event.rawPayload === "object" &&
+            !Array.isArray(event.rawPayload) &&
+            typeof event.rawPayload.From === "string"
+              ? event.rawPayload.From
+              : undefined,
+          errorCode: event.errorCode ?? undefined,
+          errorMessage: event.errorMessage ?? undefined,
+          occurredAt: event.occurredAt ?? event.receivedAt,
+          receivedAt: event.receivedAt,
+        });
+        if (
+          await reconcileProviderOptOutSignal(
+            event,
+            message.toPhone,
+            phoneDispatchLockAlreadyHeld,
+          )
+        ) {
+          await markProviderOptOutProcessed(event, message.id);
+        }
+        matched += 1;
+      };
+
+      const normalizedPhone = normalizeUSPhone(message.toPhone);
+      if (
+        normalizedPhone &&
+        isProviderOptOutSignal(event.providerKey, event.errorCode)
+      ) {
+        await withSmsPhoneDispatchLock(normalizedPhone, () =>
+          reconcileEvent(true),
+        );
+      } else {
+        await reconcileEvent(false);
+      }
     } catch (error) {
       await db.smsStatusEvent.update({
         where: { id: event.id },
@@ -238,6 +451,7 @@ export async function reconcileSynchronousSmsProviderResults(limit = 100) {
       providerStatus: true,
       actualSegmentCount: true,
       actualCostMicros: true,
+      currency: true,
       acceptedAt: true,
       attempts: {
         orderBy: { attemptNumber: "desc" },
@@ -275,6 +489,8 @@ export async function reconcileSynchronousSmsProviderResults(limit = 100) {
       },
       actualSegmentCount: message.actualSegmentCount ?? undefined,
       actualCostMicros: message.actualCostMicros ?? undefined,
+      currency:
+        message.actualCostMicros === null ? undefined : message.currency,
       occurredAt,
       receivedAt: new Date(),
     });

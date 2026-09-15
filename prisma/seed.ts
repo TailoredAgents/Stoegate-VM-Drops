@@ -43,6 +43,11 @@ async function main() {
       "Estimated provider cost per SMS segment in USD micros",
     ],
     [
+      "sms_carrier_surcharge_per_outbound_segment_micros",
+      0,
+      "Estimated carrier surcharge per outbound SMS segment in USD micros",
+    ],
+    [
       "sms_cost_per_inbound_message_micros",
       0,
       "Estimated provider cost per inbound SMS in USD micros",
@@ -98,7 +103,7 @@ async function main() {
     ],
     [
       "sms_provider_display_name",
-      "Not selected",
+      "Twilio",
       "Operator-facing SMS provider label",
     ],
     [
