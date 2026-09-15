@@ -30,9 +30,11 @@ live messages.
 
 ```text
 Import and validate a contact/property list
-  -> select a versioned template and review personalized message previews
+  -> optionally ask OpenAI for a generic template draft
+  -> review and explicitly approve an immutable template version
+  -> select that version and review deterministic personalized previews
   -> approve a dry-run campaign
-  -> enqueue auditable per-contact attempts
+  -> enqueue auditable per-contact attempts at the campaign's chosen interval
   -> record sent, delivered, failed, reply, or suppression events
   -> classify replies in the compact SMS inbox
   -> after 48 elapsed hours from confirmed send with no reply, become call-eligible
@@ -54,6 +56,7 @@ source of truth; process memory and Render disk are not.
 - Database-backed users and opaque, hashed sessions
 - Provider-neutral SMS boundary with `dry-run` and a gated Twilio Messaging
   Service adapter
+- Optional admin-only OpenAI assistance for generic template drafting
 - Audited CSV exports/imports with immutable row snapshots
 
 The web service validates requests and records intent. Bounded background work
@@ -89,6 +92,29 @@ Open `http://localhost:3000` and sign in with the configured admin account.
 | `DEFAULT_SMS_TO_COLD_CALL_DELAY_HOURS` | `48`             | Elapsed delay after a confirmed SMS send                      |
 | `TWILIO_PRODUCTION_APPROVED`           | `false`          | Independent acknowledgement gate after real A2P approval      |
 
+Each campaign also snapshots a configurable interval from 1 to 3,600 seconds.
+Messages receive deterministic staggered schedules, and live provider
+submissions for one campaign are serialized and rechecked against that
+interval. If a worker or queue is delayed, overdue messages do not collapse
+into a simultaneous burst.
+
+### Optional OpenAI template drafting
+
+OpenAI is not required to run the application. To enable drafting on the web
+service, set `OPENAI_API_KEY`, keep `OPENAI_MODEL=gpt-6-astra`, and set
+`OPENAI_TEMPLATE_DRAFTING_ENABLED=true`. Leave those variables off the worker;
+it never calls OpenAI.
+
+The Templates screen sends only an admin's drafting instructions and the
+existing generic template body. It does not send CSV rows, contact records,
+phone numbers, or property-owner data. Every generated result is stored as an
+immutable, audited `DRAFT` with its model and response ID. It must pass the same
+template-variable validation and receive a separate admin approval before a
+campaign can select it. OpenAI is never called during campaign preparation or
+message dispatch, so personalization remains deterministic and reviewable.
+This feature drafts the initial SMS only; it does not create or automatically
+send a multi-message follow-up sequence.
+
 The optional Twilio configuration is `TWILIO_ACCOUNT_SID`,
 `TWILIO_AUTH_TOKEN`, and `TWILIO_MESSAGING_SERVICE_SID`. The Auth Token is a
 secret. The application sends through the Messaging Service Sender Pool and
@@ -123,6 +149,11 @@ the manually configured Render environment.
 The campaign importer accepts CSV/XLSX contact and property data, normalizes US
 phone numbers to E.164, retains original source rows, checks global
 suppression, and keeps distinct properties associated with the same phone.
+The operator explicitly maps one source column to the required `phone` field
+and can map name, address, location, acreage, property type, source, and
+external-ID columns. The current importer does not implement prioritized
+phone-1/phone-2 fallback; select the single phone column to use for that
+campaign.
 
 Exports and outcome imports should carry Stonegate contact and campaign-contact
 IDs. When several identifiers are supplied, all of them must agree. A phone or
@@ -163,6 +194,10 @@ settings. Existing Blueprint resources do not automatically acquire new
 `sync: false` values. The web service generates its own `SESSION_SECRET`; set a
 separate 32-or-more-character value on the worker. The worker validates the
 setting but does not issue or verify web login sessions.
+
+OpenAI drafting is also off by default. If used, add `OPENAI_API_KEY` only to
+the web service and then change `OPENAI_TEMPLATE_DRAFTING_ENABLED` there to
+`true`. Do not add the key to source control or the worker.
 
 Both services run the same idempotent Prisma migration command before starting,
 so independently timed web and worker deploys cannot start new code against the

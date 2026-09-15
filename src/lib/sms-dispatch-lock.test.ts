@@ -34,10 +34,12 @@ vi.mock("@/lib/env", () => ({ getEnv: mocks.getEnv }));
 
 import {
   lockSmsCampaignDispatchTx,
+  lockSmsCampaignPacingTx,
   lockSmsPhoneDispatchTx,
   lockSmsProviderReadinessSharedTx,
   lockSmsProviderReadinessTx,
   smsCampaignDispatchLockKey,
+  smsCampaignPacingLockKey,
   smsPhoneDispatchLockKey,
   smsProviderReadinessLockKey,
   withSmsDispatchLock,
@@ -69,11 +71,13 @@ describe("SMS dispatch advisory locks", () => {
     expect(mocks.events).toEqual([
       "connect",
       `query:SELECT pg_advisory_lock_shared(hashtext($1))::text AS locked:${smsProviderReadinessLockKey("twilio")}`,
+      `query:SELECT pg_advisory_lock(hashtext($1))::text AS locked:${smsCampaignPacingLockKey("campaign-1")}`,
       `query:SELECT pg_advisory_lock_shared(hashtext($1))::text AS locked:${smsCampaignDispatchLockKey("campaign-1")}`,
       `query:SELECT pg_advisory_lock(hashtext($1))::text AS locked:${smsPhoneDispatchLockKey("+12025550123")}`,
       "provider-and-persistence",
       `query:SELECT pg_advisory_unlock(hashtext($1))::text AS unlocked:${smsPhoneDispatchLockKey("+12025550123")}`,
       `query:SELECT pg_advisory_unlock_shared(hashtext($1))::text AS unlocked:${smsCampaignDispatchLockKey("campaign-1")}`,
+      `query:SELECT pg_advisory_unlock(hashtext($1))::text AS unlocked:${smsCampaignPacingLockKey("campaign-1")}`,
       `query:SELECT pg_advisory_unlock_shared(hashtext($1))::text AS unlocked:${smsProviderReadinessLockKey("twilio")}`,
       "end",
     ]);
@@ -93,8 +97,9 @@ describe("SMS dispatch advisory locks", () => {
       ),
     ).rejects.toThrow("provider failed");
 
-    expect(mocks.events.at(-4)).toContain("pg_advisory_unlock(hashtext");
-    expect(mocks.events.at(-3)).toContain("pg_advisory_unlock_shared");
+    expect(mocks.events.at(-5)).toContain("pg_advisory_unlock(hashtext");
+    expect(mocks.events.at(-4)).toContain("pg_advisory_unlock_shared");
+    expect(mocks.events.at(-3)).toContain("pg_advisory_unlock(hashtext");
     expect(mocks.events.at(-2)).toContain("pg_advisory_unlock_shared");
     expect(mocks.events.at(-1)).toBe("end");
   });
@@ -118,6 +123,7 @@ describe("SMS dispatch advisory locks", () => {
 
     await lockSmsPhoneDispatchTx(tx as never, "+12025550123");
     await lockSmsCampaignDispatchTx(tx as never, "campaign-1");
+    await lockSmsCampaignPacingTx(tx as never, "campaign-1");
     await lockSmsProviderReadinessSharedTx(tx as never, "Twilio");
     await lockSmsProviderReadinessTx(tx as never, "twilio");
 
@@ -128,9 +134,12 @@ describe("SMS dispatch advisory locks", () => {
       smsCampaignDispatchLockKey("campaign-1"),
     );
     expect(tx.$queryRaw.mock.calls[2]?.[1]).toBe(
-      smsProviderReadinessLockKey("twilio"),
+      smsCampaignPacingLockKey("campaign-1"),
     );
     expect(tx.$queryRaw.mock.calls[3]?.[1]).toBe(
+      smsProviderReadinessLockKey("twilio"),
+    );
+    expect(tx.$queryRaw.mock.calls[4]?.[1]).toBe(
       smsProviderReadinessLockKey("twilio"),
     );
   });

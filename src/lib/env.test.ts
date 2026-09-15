@@ -27,11 +27,35 @@ describe("SMS environment safety", () => {
   it("defaults to provider-neutral dry-run operation", async () => {
     const { getEnv } = await import("./env");
     expect(getEnv()).toMatchObject({
+      OPENAI_MODEL: "gpt-6-astra",
+      OPENAI_TEMPLATE_DRAFTING_ENABLED: false,
       SMS_PROVIDER: "dry-run",
       SMS_LIVE_SENDS_ENABLED: false,
       TWILIO_PRODUCTION_APPROVED: false,
       DEFAULT_DAILY_SMS_LIMIT: 2000,
       DEFAULT_SMS_TO_COLD_CALL_DELAY_HOURS: 48,
+    });
+  });
+
+  it("requires an API key when OpenAI template drafting is enabled", async () => {
+    process.env.OPENAI_TEMPLATE_DRAFTING_ENABLED = "true";
+    const { getEnv } = await import("./env");
+
+    expect(() => getEnv()).toThrow(
+      "OPENAI_API_KEY is required when OpenAI template drafting is enabled",
+    );
+  });
+
+  it("accepts an optional OpenAI drafting configuration", async () => {
+    process.env.OPENAI_TEMPLATE_DRAFTING_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-only-key";
+    process.env.OPENAI_MODEL = "gpt-6-astra";
+    const { getEnv } = await import("./env");
+
+    expect(getEnv()).toMatchObject({
+      OPENAI_API_KEY: "test-only-key",
+      OPENAI_MODEL: "gpt-6-astra",
+      OPENAI_TEMPLATE_DRAFTING_ENABLED: true,
     });
   });
 

@@ -6,6 +6,7 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { requireUser } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { draftSmsTemplateWithOpenAI } from "@/lib/openai-template-drafting";
 import { validateSmsTemplate } from "@/lib/sms";
 import { sha256 } from "@/lib/utils";
 
@@ -111,6 +112,105 @@ export async function createSmsTemplateVersionAction(formData: FormData) {
             body,
             contentHash,
             createdByUserId: user.id,
+          },
+        });
+      },
+      {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        maxWait: 10_000,
+        timeout: 30_000,
+      },
+    ),
+  );
+  revalidatePath("/templates");
+}
+
+export async function generateAiSmsTemplateVersionAction(formData: FormData) {
+  const user = await requireUser();
+  if (user.role !== "ADMIN") throw new Error("Admin access required");
+  const input = z
+    .object({
+      templateId: z.uuid(),
+      instructions: z.string().trim().min(10).max(1_500),
+    })
+    .parse(Object.fromEntries(formData));
+  const template = await db.smsTemplate.findUnique({
+    where: { id: input.templateId },
+    include: { versions: { orderBy: { version: "desc" }, take: 1 } },
+  });
+  if (!template) throw new Error("SMS template not found");
+  if (!template.active) throw new Error("This SMS template is inactive");
+
+  // Only operator-authored instructions and generic template text leave the
+  // application. Contact/import rows are deliberately outside this code path.
+  const draft = await draftSmsTemplateWithOpenAI({
+    instructions: input.instructions,
+    existingBody: template.versions[0]?.body,
+  });
+  const body = validatedBody(draft.body);
+  const contentHash = templateHash(body);
+  await withSerializableRetry(() =>
+    db.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`
+          SELECT pg_advisory_xact_lock(
+            hashtext(${`sms-template:${input.templateId}`})
+          )::text AS locked
+        `;
+        const current = await tx.smsTemplate.findUnique({
+          where: { id: input.templateId },
+          select: { id: true, active: true },
+        });
+        if (!current) throw new Error("SMS template not found");
+        if (!current.active) throw new Error("This SMS template is inactive");
+        const duplicate = await tx.smsTemplateVersion.findFirst({
+          where: { templateId: current.id, contentHash },
+          select: { version: true },
+        });
+        if (duplicate) {
+          throw new Error(
+            `This content already exists as version ${duplicate.version}`,
+          );
+        }
+        const latest = await tx.smsTemplateVersion.aggregate({
+          where: { templateId: current.id },
+          _max: { version: true },
+        });
+        const created = await tx.smsTemplateVersion.create({
+          data: {
+            templateId: current.id,
+            version: (latest._max.version ?? 0) + 1,
+            body,
+            contentHash,
+            status: "DRAFT",
+            draftSource: "OPENAI",
+            aiModel: draft.model,
+            aiResponseId: draft.responseId,
+            aiInstructions: input.instructions,
+            aiRationale: draft.rationale,
+            createdByUserId: user.id,
+          },
+        });
+        await tx.smsAuditEvent.create({
+          data: {
+            eventType: "OPENAI_SMS_TEMPLATE_DRAFT_GENERATED",
+            entityType: "SmsTemplateVersion",
+            entityId: created.id,
+            actorUserId: user.id,
+            idempotencyKey: `openai-sms-template-draft:${draft.responseId}`,
+            source: "templates_ui",
+            after: {
+              status: "DRAFT",
+              draftSource: "OPENAI",
+              templateId: current.id,
+              version: created.version,
+            },
+            metadata: {
+              model: draft.model,
+              responseId: draft.responseId,
+              usage: draft.usage,
+            },
+            occurredAt: created.createdAt,
           },
         });
       },

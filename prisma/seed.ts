@@ -68,6 +68,11 @@ async function main() {
       "Elapsed hours after a confirmed SMS send before cold-call eligibility",
     ],
     [
+      "sms_send_interval_seconds",
+      5,
+      "Default minimum seconds between SMS submissions in one campaign",
+    ],
+    [
       "daily_sms_cap",
       positiveInteger(process.env.DEFAULT_DAILY_SMS_LIMIT, 2000),
       "Global local-day SMS attempt operating cap",

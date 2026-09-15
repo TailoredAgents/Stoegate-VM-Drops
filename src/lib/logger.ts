@@ -14,6 +14,7 @@ export const logger = pino({
       "*.token",
       "SMS_PROVIDER_WEBHOOK_SECRET",
       "TWILIO_AUTH_TOKEN",
+      "OPENAI_API_KEY",
     ],
     censor: "[REDACTED]",
   },

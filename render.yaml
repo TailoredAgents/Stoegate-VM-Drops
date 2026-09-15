@@ -39,6 +39,13 @@ services:
         sync: false
       - key: ADMIN_PASSWORD_HASH
         sync: false
+      # Optional admin-only template drafting. The worker does not need these.
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-6-astra
+      - key: OPENAI_TEMPLATE_DRAFTING_ENABLED
+        value: "false"
       - key: SMS_LIVE_SENDS_ENABLED
         value: "false"
       - key: SMS_PROVIDER

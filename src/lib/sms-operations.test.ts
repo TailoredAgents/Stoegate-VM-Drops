@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   localDateKey: vi.fn(),
   localDateStorageValue: vi.fn(),
   assertFreshTwilioReadiness: vi.fn(),
+  lockSmsCampaignPacingTx: vi.fn(),
   lockSmsProviderReadinessSharedTx: vi.fn(),
 }));
 
@@ -24,6 +25,7 @@ vi.mock("@/lib/twilio-readiness", () => ({
   assertFreshTwilioReadiness: mocks.assertFreshTwilioReadiness,
 }));
 vi.mock("@/lib/sms-dispatch-lock", () => ({
+  lockSmsCampaignPacingTx: mocks.lockSmsCampaignPacingTx,
   lockSmsProviderReadinessSharedTx: mocks.lockSmsProviderReadinessSharedTx,
 }));
 vi.mock("@/lib/time", () => ({
@@ -77,6 +79,7 @@ function validMessage() {
     sentAt: null as Date | null,
     campaignContact: {
       id: "20000000-0000-4000-8000-000000000002",
+      campaignId: "70000000-0000-4000-8000-000000000007",
       status: "QUEUED",
       selectedForSend: true,
       contact: {
@@ -95,6 +98,7 @@ function validMessage() {
         smsTemplateVersionId: "40000000-0000-4000-8000-000000000004",
         smsScheduleTimezone: "America/Chicago",
         smsScheduledFor: null as Date | null,
+        smsSendIntervalSeconds: 5,
         smsSendWindowStartMinutes: 9 * 60,
         smsSendWindowEndMinutes: 20 * 60,
         smsColdCallDelayHours: 48,
@@ -159,6 +163,7 @@ function makeTx(message: ReturnType<typeof validMessage>) {
     },
     smsOutboundAttempt: {
       findUnique: vi.fn().mockResolvedValue(null),
+      findFirst: vi.fn().mockResolvedValue(null),
       findUniqueOrThrow: vi.fn(async () => attempt),
       count: vi.fn().mockResolvedValue(0),
       create: vi.fn().mockResolvedValue({ id: attempt.id }),
@@ -261,6 +266,10 @@ describe("atomic live SMS reservation", () => {
       tx,
       "provider-x",
     );
+    expect(mocks.lockSmsCampaignPacingTx).toHaveBeenCalledWith(
+      tx,
+      message.campaignContact.campaign.id,
+    );
     expect(tx.smsOutboundAttempt.create).toHaveBeenCalledTimes(1);
     expect(tx.smsUsageLedger.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ kind: "ATTEMPT", messageId: message.id }),
@@ -324,9 +333,29 @@ describe("atomic live SMS reservation", () => {
       messageId: message.id,
       occurredAt: NOW,
       readinessLockAlreadyHeld: true,
+      pacingLockAlreadyHeld: true,
     });
 
     expect(mocks.lockSmsProviderReadinessSharedTx).not.toHaveBeenCalled();
+    expect(mocks.lockSmsCampaignPacingTx).not.toHaveBeenCalled();
+  });
+
+  it("defers a campaign submission until its pacing interval has elapsed", async () => {
+    tx.smsOutboundAttempt.findFirst.mockResolvedValue({
+      startedAt: new Date(NOW.getTime() - 2_000),
+    });
+
+    const error = await reserveLiveSmsAttempt({
+      messageId: message.id,
+      occurredAt: NOW,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(SmsAttemptDeferredError);
+    expect(error).toMatchObject({
+      reason: "CAMPAIGN_PACING",
+      nextAllowedAt: new Date(NOW.getTime() + 3_000),
+    });
+    expect(tx.smsOutboundAttempt.create).not.toHaveBeenCalled();
   });
 
   it("passes the complete Twilio readiness guard and reserves with only a Messaging Service", async () => {

@@ -73,7 +73,10 @@ The previous implementation is retained at `archive/rvm-v1`; see
 7. **Complete:** implement the Twilio adapter, native signed webhooks, read-only
    diagnostics, cost reconciliation support, and independent approval gate
    against the existing domain.
-8. **Pending external approval:** complete Twilio account/A2P, operational, and
+8. **Complete:** add per-campaign SMS pacing with deterministic schedules and a
+   live dispatch-time interval guard; add optional OpenAI-assisted template
+   drafting that always requires separate human approval.
+9. **Pending external approval:** complete Twilio account/A2P, operational, and
    legal review, then run a
    deliberately limited live acceptance campaign before raising either hard
    ceiling.
@@ -111,6 +114,11 @@ names and blank placeholders are documented; real values remain secret.
   `sent` events cannot reset an already-running delay.
 - Workers use bounded concurrency, chunked queries, retry backoff, and
   per-contact errors rather than one unbounded campaign transaction.
+- Every campaign snapshots a 1-to-3,600-second submission interval. Scheduled
+  work is staggered, and a campaign-scoped dispatch lock prevents overdue jobs
+  from bursting through the provider concurrently.
+- OpenAI may create only generic, audited template drafts. It receives no
+  campaign contact data and has no execution path in the sending worker.
 - Render disk is ephemeral and is not a source of campaign or export state.
 
 ## Twilio account gate

@@ -7,6 +7,10 @@ export function smsCampaignDispatchLockKey(campaignId: string) {
   return `sms-campaign-dispatch:${campaignId}`;
 }
 
+export function smsCampaignPacingLockKey(campaignId: string) {
+  return `sms-campaign-pacing:${campaignId}`;
+}
+
 export function smsProviderReadinessLockKey(providerKey: string) {
   return `sms-provider-readiness:${providerKey.trim().toLowerCase()}`;
 }
@@ -20,6 +24,16 @@ export async function lockSmsCampaignDispatchTx(
   campaignId: string,
 ) {
   const key = smsCampaignDispatchLockKey(campaignId);
+  await tx.$queryRaw`
+    SELECT pg_advisory_xact_lock(hashtext(${key}))::text AS locked
+  `;
+}
+
+export async function lockSmsCampaignPacingTx(
+  tx: Prisma.TransactionClient,
+  campaignId: string,
+) {
+  const key = smsCampaignPacingLockKey(campaignId);
   await tx.$queryRaw`
     SELECT pg_advisory_xact_lock(hashtext(${key}))::text AS locked
   `;
@@ -70,9 +84,11 @@ export async function withSmsDispatchLock<T>(
 ): Promise<T> {
   const client = new Client({ connectionString: getEnv().DATABASE_URL });
   const readinessKey = smsProviderReadinessLockKey(input.providerKey);
+  const pacingKey = smsCampaignPacingLockKey(input.campaignId);
   const campaignKey = smsCampaignDispatchLockKey(input.campaignId);
   const phoneKey = smsPhoneDispatchLockKey(input.normalizedPhone);
   let readinessLocked = false;
+  let pacingLocked = false;
   let campaignLocked = false;
   let phoneLocked = false;
 
@@ -86,8 +102,16 @@ export async function withSmsDispatchLock<T>(
       [readinessKey],
     );
     readinessLocked = true;
+    // One campaign submission owns this lock through provider persistence.
+    // Reservation then checks the previous attempt timestamp, preventing a
+    // delayed queue from collapsing its originally staggered jobs into a burst.
+    await client.query(
+      "SELECT pg_advisory_lock(hashtext($1))::text AS locked",
+      [pacingKey],
+    );
+    pacingLocked = true;
     // Shared campaign locks permit parallel contacts while an exclusive pause
-    // lock waits for every in-flight dispatch to finish.
+    // lock waits for the current in-flight dispatch to finish.
     await client.query(
       "SELECT pg_advisory_lock_shared(hashtext($1))::text AS locked",
       [campaignKey],
@@ -110,6 +134,11 @@ export async function withSmsDispatchLock<T>(
         await client.query(
           "SELECT pg_advisory_unlock_shared(hashtext($1))::text AS unlocked",
           [campaignKey],
+        );
+      if (pacingLocked)
+        await client.query(
+          "SELECT pg_advisory_unlock(hashtext($1))::text AS unlocked",
+          [pacingKey],
         );
       if (readinessLocked)
         await client.query(

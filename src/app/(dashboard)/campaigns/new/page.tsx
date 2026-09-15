@@ -52,6 +52,7 @@ export default async function NewCampaignPage() {
           defaultColdCallDelayHours={
             getEnv().DEFAULT_SMS_TO_COLD_CALL_DELAY_HOURS
           }
+          defaultSendIntervalSeconds={settings.sms_send_interval_seconds}
           defaultTimezone={settings.operations_timezone}
         />
       )}

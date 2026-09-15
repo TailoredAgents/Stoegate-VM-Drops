@@ -37,6 +37,11 @@ enum SmsTemplateStatus {
   RETIRED
 }
 
+enum SmsTemplateDraftSource {
+  MANUAL
+  OPENAI
+}
+
 enum SmsComplianceStatus {
   DRAFT
   PENDING_REVIEW
@@ -397,6 +402,8 @@ model Campaign {
   smsCostConfig                    Json?
   smsScheduleTimezone              String                 @default("America/New_York")
   smsScheduledFor                  DateTime?
+  /// Minimum elapsed time between provider submissions for this campaign.
+  smsSendIntervalSeconds           Int                    @default(5)
   smsSendWindowStartMinutes        Int?
   smsSendWindowEndMinutes          Int?
   smsEstimatedCostPerSegmentMicros Int                    @default(0)
@@ -574,20 +581,25 @@ model SmsTemplate {
 }
 
 model SmsTemplateVersion {
-  id               String               @id @default(uuid()) @db.Uuid
-  templateId       String               @db.Uuid
+  id               String                 @id @default(uuid()) @db.Uuid
+  templateId       String                 @db.Uuid
   version          Int
   body             String
   contentHash      String
-  status           SmsTemplateStatus    @default(DRAFT)
-  createdByUserId  String               @db.Uuid
-  approvedByUserId String?              @db.Uuid
+  status           SmsTemplateStatus      @default(DRAFT)
+  draftSource      SmsTemplateDraftSource @default(MANUAL)
+  aiModel          String?
+  aiResponseId     String?                @unique
+  aiInstructions   String?
+  aiRationale      String?
+  createdByUserId  String                 @db.Uuid
+  approvedByUserId String?                @db.Uuid
   approvedAt       DateTime?
   retiredAt        DateTime?
-  createdAt        DateTime             @default(now())
-  template         SmsTemplate          @relation(fields: [templateId], references: [id], onDelete: Cascade)
-  createdBy        User                 @relation("SmsTemplateVersionCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
-  approvedBy       User?                @relation("SmsTemplateVersionApprover", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  createdAt        DateTime               @default(now())
+  template         SmsTemplate            @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  createdBy        User                   @relation("SmsTemplateVersionCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  approvedBy       User?                  @relation("SmsTemplateVersionApprover", fields: [approvedByUserId], references: [id], onDelete: SetNull)
   campaigns        Campaign[]
   outboundMessages SmsOutboundMessage[]
 

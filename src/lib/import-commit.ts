@@ -4,6 +4,7 @@ import { db } from "@/lib/db";
 import { getEnv } from "@/lib/env";
 import type { CanonicalField } from "@/lib/import-fields";
 import { getAppSettings } from "@/lib/settings";
+import { requireSmsSendIntervalSeconds } from "@/lib/sms-pacing";
 
 const IMPORT_COMMIT_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -16,6 +17,7 @@ export interface CommitSmsImportInput {
   smsTemplateVersionId: string;
   sendLimit?: number;
   dailySendCap?: number;
+  sendIntervalSeconds?: number;
   timezone: string;
   scheduledFor: Date | null;
   sendWindowStartMinutes: number;
@@ -112,6 +114,9 @@ export async function commitSmsImport(input: CommitSmsImportInput) {
       const dailyCap = input.dailySendCap ?? env.DEFAULT_DAILY_SMS_LIMIT;
       const delayHours =
         input.coldCallDelayHours ?? env.DEFAULT_SMS_TO_COLD_CALL_DELAY_HOURS;
+      const sendIntervalSeconds = requireSmsSendIntervalSeconds(
+        input.sendIntervalSeconds ?? settings.sms_send_interval_seconds,
+      );
 
       const campaign = await tx.campaign.create({
         data: {
@@ -142,6 +147,7 @@ export async function commitSmsImport(input: CommitSmsImportInput) {
               : undefined,
           smsScheduleTimezone: input.timezone,
           smsScheduledFor: input.scheduledFor,
+          smsSendIntervalSeconds: sendIntervalSeconds,
           smsSendWindowStartMinutes: input.sendWindowStartMinutes,
           smsSendWindowEndMinutes: input.sendWindowEndMinutes,
           smsEstimatedCostPerSegmentMicros:

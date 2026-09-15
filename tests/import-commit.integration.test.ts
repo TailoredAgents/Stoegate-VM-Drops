@@ -79,6 +79,7 @@ function commitInput(batchId: string, source: string, campaignName: string) {
     scheduledFor: null,
     sendWindowStartMinutes: 9 * 60,
     sendWindowEndMinutes: 20 * 60,
+    sendIntervalSeconds: 7,
     createdByUserId: adminId,
   };
 }
@@ -153,6 +154,12 @@ describe("atomic import commits", () => {
         .campaignId,
     );
     expect(await db.campaign.count({ where: { sourceName: source } })).toBe(1);
+    expect(
+      await db.campaign.findUniqueOrThrow({
+        where: { id: committedBatch.campaignId! },
+        select: { smsSendIntervalSeconds: true },
+      }),
+    ).toEqual({ smsSendIntervalSeconds: 7 });
     expect(
       await db.campaignContact.count({
         where: { campaignId: committedBatch.campaignId! },

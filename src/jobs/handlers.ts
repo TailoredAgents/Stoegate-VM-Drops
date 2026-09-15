@@ -22,6 +22,7 @@ import {
   SmsAttemptDeferredError,
 } from "@/lib/sms-operations";
 import { prepareSmsMessage } from "@/lib/sms";
+import { scheduledSmsTime } from "@/lib/sms-pacing";
 import { initialOutboundFromPhone } from "@/lib/sms-provider-routing";
 import {
   reconcileSynchronousSmsProviderResults,
@@ -242,6 +243,7 @@ async function prepareBulk(campaignId: string) {
 
   const contacts = await db.campaignContact.findMany({
     where: { campaignId, selectedForSend: true },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     include: {
       contact: true,
       property: true,
@@ -260,7 +262,12 @@ async function prepareBulk(campaignId: string) {
     id: string;
     scheduledFor: Date | null;
   }> = [];
-  for (const contact of contacts) {
+  for (const [contactIndex, contact] of contacts.entries()) {
+    const scheduledFor = scheduledSmsTime(
+      startAt,
+      contactIndex,
+      campaign.smsSendIntervalSeconds,
+    );
     let messageId = contact.outboundMessages[0]?.id;
     if (!messageId) {
       const prepared = prepareSmsMessage(
@@ -313,7 +320,7 @@ async function prepareBulk(campaignId: string) {
             status: "QUEUED",
             estimatedCostMicros,
             currency: campaign.smsCurrency,
-            scheduledFor: startAt,
+            scheduledFor,
             queuedAt: new Date(),
             complianceSnapshot: {
               campaignComplianceStatus: campaign.smsComplianceStatus,
@@ -324,6 +331,7 @@ async function prepareBulk(campaignId: string) {
               timezone: campaign.smsScheduleTimezone,
               sendWindowStartMinutes: campaign.smsSendWindowStartMinutes,
               sendWindowEndMinutes: campaign.smsSendWindowEndMinutes,
+              sendIntervalSeconds: campaign.smsSendIntervalSeconds,
             },
           },
           update: {},
@@ -345,9 +353,9 @@ async function prepareBulk(campaignId: string) {
           source: "sms_campaign_worker",
           occurredAt: created.queuedAt ?? new Date(),
           projection: {
-            smsScheduledFor: startAt,
+            smsScheduledFor: scheduledFor,
             smsToColdCallDelayHours: campaign.smsColdCallDelayHours,
-            nextEligibleAt: startAt,
+            nextEligibleAt: scheduledFor,
           },
         });
         return created;
@@ -509,6 +517,7 @@ export async function handleSendSms(job: Job<unknown>) {
                 messageId: message.id,
                 occurredAt: new Date(),
                 readinessLockAlreadyHeld: true,
+                pacingLockAlreadyHeld: true,
               });
             } catch (error) {
               if (error instanceof SmsAttemptDeferredError) {

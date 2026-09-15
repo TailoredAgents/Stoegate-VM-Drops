@@ -7,6 +7,10 @@ import {
 } from "@/lib/import-commit";
 import { assertSameOrigin } from "@/lib/request-security";
 import { isValidIanaTimezone } from "@/lib/settings";
+import {
+  MAX_SMS_SEND_INTERVAL_SECONDS,
+  MIN_SMS_SEND_INTERVAL_SECONDS,
+} from "@/lib/sms-pacing";
 import { zonedDateTimeToUtc } from "@/lib/time";
 import { jsonError } from "@/lib/utils";
 
@@ -20,6 +24,11 @@ const bodySchema = z.object({
   smsTemplateVersionId: z.uuid(),
   sendLimit: z.number().int().min(1).max(100_000).optional(),
   dailySendCap: z.number().int().min(1).max(100_000).optional(),
+  sendIntervalSeconds: z
+    .number()
+    .int()
+    .min(MIN_SMS_SEND_INTERVAL_SECONDS)
+    .max(MAX_SMS_SEND_INTERVAL_SECONDS),
   timezone: z.string().trim().min(1).max(100),
   scheduledLocal: z.string().regex(localDateTime).optional(),
   sendWindowStart: z.string().regex(localTime),

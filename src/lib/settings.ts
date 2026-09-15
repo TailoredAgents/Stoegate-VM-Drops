@@ -1,5 +1,6 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { db } from "@/lib/db";
+import { MAX_SMS_SEND_INTERVAL_SECONDS } from "@/lib/sms-pacing";
 
 export const NUMERIC_SETTINGS = {
   sms_provider_fixed_monthly_fee_cents: 0,
@@ -10,6 +11,7 @@ export const NUMERIC_SETTINGS = {
   sms_phone_number_monthly_cents: 0,
   sms_registration_monthly_cents: 0,
   sms_to_cold_call_delay_hours: 48,
+  sms_send_interval_seconds: 5,
   daily_sms_cap: 2000,
   provider_billing_cycle_day: 1,
   infrastructure_monthly_overhead_cents: 0,
@@ -45,6 +47,7 @@ export type AppSettings = {
 type SettingsClient = PrismaClient | Prisma.TransactionClient;
 
 const positiveNumericSettings = new Set<NumericSettingKey>([
+  "sms_send_interval_seconds",
   "daily_sms_cap",
   "provider_billing_cycle_day",
   "va_real_conversations_per_hour",
@@ -67,7 +70,9 @@ export async function getAppSettings(
       typeof record.value === "number" &&
       Number.isFinite(record.value) &&
       (!positiveNumericSettings.has(record.key as NumericSettingKey) ||
-        record.value > 0)
+        record.value > 0) &&
+      (record.key !== "sms_send_interval_seconds" ||
+        record.value <= MAX_SMS_SEND_INTERVAL_SECONDS)
     ) {
       result[record.key] = record.value;
     } else if (

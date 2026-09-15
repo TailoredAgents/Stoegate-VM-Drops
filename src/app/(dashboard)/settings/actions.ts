@@ -14,6 +14,7 @@ import {
   type NumericSettingKey,
   type TextSettingKey,
 } from "@/lib/settings";
+import { MAX_SMS_SEND_INTERVAL_SECONDS } from "@/lib/sms-pacing";
 import { reconcileTwilioMessageCosts } from "@/lib/twilio-cost-reconciliation";
 import {
   acknowledgeTwilioProductionApproval,
@@ -30,6 +31,7 @@ const integerKeys = new Set<NumericSettingKey>([
   "sms_phone_number_monthly_cents",
   "sms_registration_monthly_cents",
   "sms_to_cold_call_delay_hours",
+  "sms_send_interval_seconds",
   "daily_sms_cap",
   "provider_billing_cycle_day",
   "infrastructure_monthly_overhead_cents",
@@ -37,6 +39,7 @@ const integerKeys = new Set<NumericSettingKey>([
 
 const positiveKeys = new Set<NumericSettingKey>([
   "sms_to_cold_call_delay_hours",
+  "sms_send_interval_seconds",
   "daily_sms_cap",
   "provider_billing_cycle_day",
   "va_real_conversations_per_hour",
@@ -56,6 +59,14 @@ export async function updateSettingsAction(formData: FormData) {
     const value = schema.parse(formData.get(key));
     if (key === "provider_billing_cycle_day" && value > 28)
       throw new Error("Billing cycle day must be between 1 and 28");
+    if (
+      key === "sms_send_interval_seconds" &&
+      value > MAX_SMS_SEND_INTERVAL_SECONDS
+    ) {
+      throw new Error(
+        `SMS send interval must be between 1 and ${MAX_SMS_SEND_INTERVAL_SECONDS} seconds`,
+      );
+    }
     values.set(key, value);
   }
 

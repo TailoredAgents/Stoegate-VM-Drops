@@ -22,6 +22,8 @@ const baseEnv: AppEnv = {
   APP_BASE_URL: "https://sms.stonegate.example/app/path",
   SESSION_SECRET: "web-session-secret-at-least-32-characters",
   SESSION_TTL_HOURS: 12,
+  OPENAI_MODEL: "gpt-6-astra",
+  OPENAI_TEMPLATE_DRAFTING_ENABLED: false,
   SMS_LIVE_SENDS_ENABLED: true,
   SMS_PROVIDER: "twilio",
   TWILIO_ACCOUNT_SID: ACCOUNT_SID,

@@ -83,13 +83,19 @@ export default async function SettingsPage() {
                 name="sms_to_cold_call_delay_hours"
                 value={settings.sms_to_cold_call_delay_hours}
               />
+              <SettingInput
+                label="Default seconds between SMS"
+                name="sms_send_interval_seconds"
+                value={settings.sms_send_interval_seconds}
+                min="1"
+                max="3600"
+              />
               <TextInput
                 label="Operations timezone"
                 name="operations_timezone"
                 value={settings.operations_timezone}
                 placeholder="America/New_York"
               />
-              <div className="hidden sm:block" />
               <TextInput
                 label="SMS send window starts"
                 name="sms_send_window_start"
@@ -503,12 +509,14 @@ function SettingInput({
   name,
   value,
   step = "1",
+  min = "0",
   max,
 }: {
   label: string;
   name: string;
   value: number;
   step?: string;
+  min?: string;
   max?: string;
 }) {
   return (
@@ -517,7 +525,7 @@ function SettingInput({
       <input
         className="input"
         type="number"
-        min="0"
+        min={min}
         max={max}
         step={step}
         name={name}

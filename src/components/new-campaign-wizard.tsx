@@ -47,11 +47,13 @@ export function NewCampaignWizard({
   templates,
   defaultDailyLimit,
   defaultColdCallDelayHours,
+  defaultSendIntervalSeconds,
   defaultTimezone,
 }: {
   templates: TemplateOption[];
   defaultDailyLimit: number;
   defaultColdCallDelayHours: number;
+  defaultSendIntervalSeconds: number;
   defaultTimezone: string;
 }) {
   const router = useRouter();
@@ -64,6 +66,9 @@ export function NewCampaignWizard({
   const [templateId, setTemplateId] = useState(templates[0]?.id ?? "");
   const [sendLimit, setSendLimit] = useState(defaultDailyLimit);
   const [dailySendCap, setDailySendCap] = useState(defaultDailyLimit);
+  const [sendIntervalSeconds, setSendIntervalSeconds] = useState(
+    defaultSendIntervalSeconds,
+  );
   const [timezone, setTimezone] = useState(defaultTimezone);
   const [scheduledLocal, setScheduledLocal] = useState("");
   const [windowStart, setWindowStart] = useState("09:00");
@@ -149,6 +154,7 @@ export function NewCampaignWizard({
         smsTemplateVersionId: templateId,
         sendLimit,
         dailySendCap,
+        sendIntervalSeconds,
         timezone,
         ...(scheduledLocal ? { scheduledLocal } : {}),
         sendWindowStart: windowStart,
@@ -388,6 +394,24 @@ export function NewCampaignWizard({
               />
             </label>
           </div>
+          <label className="block">
+            <span className="label">Seconds between SMS submissions</span>
+            <input
+              className="input"
+              type="number"
+              min={1}
+              max={3600}
+              value={sendIntervalSeconds}
+              onChange={(event) =>
+                setSendIntervalSeconds(Number(event.target.value))
+              }
+            />
+            <span className="mt-1 block text-xs leading-5 text-slate-500">
+              Each message gets its own scheduled time, and live sending
+              enforces at least this much time between provider submissions in
+              this campaign.
+            </span>
+          </label>
           <label className="block">
             <span className="label">Timezone</span>
             <input

@@ -25,6 +25,9 @@ const envSchema = z
     ADMIN_EMAIL: z.email().optional(),
     ADMIN_PASSWORD: z.string().min(12).optional(),
     ADMIN_PASSWORD_HASH: z.string().optional(),
+    OPENAI_API_KEY: optionalEnvironmentValue(z.string().trim().min(1)),
+    OPENAI_MODEL: z.string().trim().min(1).default("gpt-6-astra"),
+    OPENAI_TEMPLATE_DRAFTING_ENABLED: booleanString,
     SMS_LIVE_SENDS_ENABLED: booleanString,
     SMS_PROVIDER: z.string().trim().toLowerCase().min(1).default("dry-run"),
     SMS_PROVIDER_WEBHOOK_SECRET: z.string().min(24).optional(),
@@ -74,6 +77,14 @@ const envSchema = z
     LOG_LEVEL: z.string().default("info"),
   })
   .superRefine((env, ctx) => {
+    if (env.OPENAI_TEMPLATE_DRAFTING_ENABLED && !env.OPENAI_API_KEY) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["OPENAI_API_KEY"],
+        message:
+          "OPENAI_API_KEY is required when OpenAI template drafting is enabled",
+      });
+    }
     if (!env.SMS_LIVE_SENDS_ENABLED) return;
     const provider = env.SMS_PROVIDER.toLowerCase();
     if (provider === "dry-run") {

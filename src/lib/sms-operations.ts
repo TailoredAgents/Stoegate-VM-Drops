@@ -11,7 +11,10 @@ import { getEnv } from "@/lib/env";
 import { normalizeUSPhone } from "@/lib/phone";
 import { isProviderOptOutSignal } from "@/lib/provider-suppression";
 import { getAppSettings } from "@/lib/settings";
-import { lockSmsProviderReadinessSharedTx } from "@/lib/sms-dispatch-lock";
+import {
+  lockSmsCampaignPacingTx,
+  lockSmsProviderReadinessSharedTx,
+} from "@/lib/sms-dispatch-lock";
 import { assertFreshTwilioReadiness } from "@/lib/twilio-readiness";
 import {
   getBusinessSendWindowAvailability,
@@ -55,6 +58,7 @@ const RESERVABLE_SEQUENCE_STATES = [
 export type SmsAttemptDeferralReason =
   | "NOT_YET_SCHEDULED"
   | "OUTSIDE_BUSINESS_SEND_WINDOW"
+  | "CAMPAIGN_PACING"
   | "CAMPAIGN_DAILY_CAP_REACHED"
   | "GLOBAL_DAILY_CAP_REACHED";
 
@@ -75,6 +79,8 @@ export interface ReserveLiveSmsAttemptInput {
   providerKey?: string;
   /** Internal: the caller holds the shared readiness lock through submission. */
   readinessLockAlreadyHeld?: boolean;
+  /** Internal: the caller holds the campaign pacing lock through submission. */
+  pacingLockAlreadyHeld?: boolean;
   requestPayload?: unknown;
   occurredAt?: Date;
 }
@@ -534,6 +540,19 @@ export async function reserveLiveSmsAttempt(
   return withSerializableRetry(async (tx) => {
     if (!input.readinessLockAlreadyHeld)
       await lockSmsProviderReadinessSharedTx(tx, providerKey);
+    if (!input.pacingLockAlreadyHeld) {
+      const pacingTarget = await tx.smsOutboundMessage.findUnique({
+        where: { id: input.messageId },
+        select: {
+          campaignContact: { select: { campaignId: true } },
+        },
+      });
+      if (!pacingTarget) throw new Error("SMS message not found");
+      await lockSmsCampaignPacingTx(
+        tx,
+        pacingTarget.campaignContact.campaignId,
+      );
+    }
     await lockReservationGraphTx(tx, input.messageId);
     const message = await tx.smsOutboundMessage.findUniqueOrThrow({
       where: { id: input.messageId },
@@ -780,6 +799,27 @@ export async function reserveLiveSmsAttempt(
         "OUTSIDE_BUSINESS_SEND_WINDOW",
         window.nextAllowedAt,
       );
+    }
+
+    const latestCampaignAttempt = await tx.smsOutboundAttempt.findFirst({
+      where: {
+        message: { campaignContact: { campaignId: campaign.id } },
+      },
+      orderBy: [{ startedAt: "desc" }, { id: "desc" }],
+      select: { startedAt: true },
+    });
+    if (latestCampaignAttempt) {
+      const nextPacedAt = new Date(
+        latestCampaignAttempt.startedAt.getTime() +
+          campaign.smsSendIntervalSeconds * 1000,
+      );
+      if (nextPacedAt > occurredAt) {
+        throw new SmsAttemptDeferredError(
+          `Campaign requires ${campaign.smsSendIntervalSeconds} seconds between SMS submissions`,
+          "CAMPAIGN_PACING",
+          nextPacedAt,
+        );
+      }
     }
 
     const [selectedCount, globalSuppression, campaignSuppression, knownLead] =

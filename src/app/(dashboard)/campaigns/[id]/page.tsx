@@ -212,6 +212,8 @@ export default async function CampaignDetailPage({
             {campaign.sourceName || "No source label"}
             {" · "}
             {campaign.smsScheduleTimezone}
+            {" · "}
+            {campaign.smsSendIntervalSeconds}s between submissions
           </p>
         </div>
         <div className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-right">

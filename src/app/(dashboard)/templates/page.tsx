@@ -1,14 +1,16 @@
 import type { Metadata } from "next";
-import { Braces, MessageSquareText, ShieldCheck } from "lucide-react";
+import { Braces, MessageSquareText, ShieldCheck, Sparkles } from "lucide-react";
 import { SmsTemplateBodyEditor } from "@/components/sms-template-body-editor";
 import { StatusBadge } from "@/components/status-badge";
 import { requireUser } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { getEnv } from "@/lib/env";
 import { SMS_SEGMENT_LIMITS, SMS_TEMPLATE_FALLBACK_POLICY } from "@/lib/sms";
 import {
   approveSmsTemplateVersionAction,
   createSmsTemplateAction,
   createSmsTemplateVersionAction,
+  generateAiSmsTemplateVersionAction,
   retireSmsTemplateVersionAction,
 } from "./actions";
 
@@ -16,6 +18,9 @@ export const metadata: Metadata = { title: "SMS templates" };
 
 export default async function SmsTemplatesPage() {
   const user = await requireUser();
+  const env = getEnv();
+  const aiDraftingAvailable =
+    env.OPENAI_TEMPLATE_DRAFTING_ENABLED && Boolean(env.OPENAI_API_KEY);
   const templates = await db.smsTemplate.findMany({
     include: {
       createdBy: { select: { email: true } },
@@ -90,6 +95,17 @@ export default async function SmsTemplatesPage() {
                             {version.createdBy.email} · hash{" "}
                             <code>{version.contentHash.slice(0, 12)}</code>
                           </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            Source:{" "}
+                            {version.draftSource === "OPENAI"
+                              ? `OpenAI (${version.aiModel})`
+                              : "Manual"}
+                          </p>
+                          {version.aiRationale ? (
+                            <p className="mt-2 max-w-2xl text-xs leading-5 text-slate-600">
+                              AI rationale: {version.aiRationale}
+                            </p>
+                          ) : null}
                           {version.approvedBy ? (
                             <p className="mt-1 text-xs text-slate-500">
                               Approved by {version.approvedBy.email} on{" "}
@@ -149,6 +165,44 @@ export default async function SmsTemplatesPage() {
                     Save draft version
                   </button>
                 </form>
+
+                {user.role === "ADMIN" ? (
+                  <form
+                    action={generateAiSmsTemplateVersionAction}
+                    className="mt-5 border-t border-slate-100 pt-5"
+                  >
+                    <input
+                      type="hidden"
+                      name="templateId"
+                      value={template.id}
+                    />
+                    <label>
+                      <span className="label">Ask OpenAI for a new draft</span>
+                      <textarea
+                        className="textarea min-h-24"
+                        name="instructions"
+                        minLength={10}
+                        maxLength={1500}
+                        placeholder="Example: Make this warmer and shorter while keeping the property address and opt-out wording."
+                        required
+                        disabled={!aiDraftingAvailable}
+                      />
+                    </label>
+                    <p className="mt-2 text-xs leading-5 text-slate-500">
+                      Do not enter homeowner data. OpenAI receives only these
+                      instructions and the existing generic template. Its output
+                      is saved as an unapproved draft and cannot be used until
+                      an admin separately approves it.
+                    </p>
+                    <button
+                      className="btn-secondary mt-3"
+                      type="submit"
+                      disabled={!aiDraftingAvailable}
+                    >
+                      <Sparkles className="h-4 w-4" /> Generate draft
+                    </button>
+                  </form>
+                ) : null}
               </details>
             );
           })}
@@ -184,6 +238,21 @@ export default async function SmsTemplatesPage() {
         </section>
 
         <aside className="space-y-5">
+          <section className="card p-5">
+            <h2 className="flex items-center gap-2 font-bold">
+              <Sparkles className="h-4 w-4 text-emerald-700" /> AI drafting
+            </h2>
+            <p className="mt-3 text-sm leading-6 text-slate-600">
+              {aiDraftingAvailable
+                ? `Available with ${env.OPENAI_MODEL}. Generated copy always starts as a draft.`
+                : "Not enabled. Add OPENAI_API_KEY and set OPENAI_TEMPLATE_DRAFTING_ENABLED=true on the web service to use it."}
+            </p>
+            <p className="mt-2 text-xs leading-5 text-slate-500">
+              AI is never called while a campaign is sending. Recipient
+              personalization still uses the reviewed template and mapped CSV
+              fields deterministically.
+            </p>
+          </section>
           <section className="card p-5">
             <h2 className="flex items-center gap-2 font-bold">
               <Braces className="h-4 w-4 text-emerald-700" /> Supported
